@@ -1,29 +1,46 @@
 import pandas as pd
 import numpy as np
+import os  # <--- 必须导入 os 模块来处理路径
 
-# 1. 设置文件路径 (请修改为你自己的路径！)
-# 比如 Windows 可能是: r"D:\Project\ServerMachineDataset\train\machine-1-1.txt"
-file_path = "/Users/chariesliu/Desktop/MyThesis/ServerMachineDataset/test/machine-1-1.txt"
+# ==========================================
+# 核心修改：自动构建绝对路径
+# ==========================================
+# 1. 获取当前脚本 (step1_inspect.py) 所在的绝对路径
+# 例如: /home/sde/MyThesis/
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
 
+# 2. 拼接数据文件的路径
+# 逻辑：当前目录 -> data -> ServerMachineDataset -> test -> machine-1-1.txt
+# os.path.join 会自动处理 Linux(/) 和 Windows(\) 的分隔符差异
+file_path = os.path.join(current_script_dir, 'data', 'ServerMachineDataset', 'test', 'machine-1-1.txt')
+
+print(f"🔍 [Debug] 正在读取文件路径: {file_path}")
+
+# ==========================================
+# 下面是原本的数据读取逻辑
+# ==========================================
 try:
-    # 2. 读取数据
-    # SMD 通常是逗号分隔的，没有表头(header=None)
+    # 检查文件是否存在，不存在直接报错提示
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件未找到！请检查路径下是否有该文件: {file_path}")
+
+    # 3. 读取数据
+    # SMD 数据通常没有表头 (header=None)
     data = pd.read_csv(file_path, header=None)
 
-    # 3. 打印数据的基本信息
-    print("=== 数据加载成功！===")
-    print(f"数据形状 (行数, 列数): {data.shape}")
-    print("行数 (Time Steps) 代表时间点数量")
-    print("列数 (Features) 代表指标数量 (SMD应该是38)")
+    # 4. 打印数据的基本信息
+    print("\n=== ✅ 数据加载成功！===")
+    print(f"数据形状 (行数 Time Steps, 列数 Features): {data.shape}")
+    print("提示：SMD 数据集通常有 38 维特征。")
 
-    print("\n=== 前 5 行数据长这样 ===")
+    print("\n=== 前 5 行数据预览 ===")
     print(data.head())
 
-    # 4. 看看数据是不是只有数字
     print("\n=== 数据统计信息 ===")
     print(data.describe())
 
-except FileNotFoundError:
-    print("错误：找不到文件！请检查 file_path 这一行是否写对了路径。")
+except FileNotFoundError as e:
+    print(f"\n❌ 路径错误: {e}")
+    print("建议：请使用 'ls -R data' 命令检查服务器上的文件名是否大小写拼写正确。")
 except Exception as e:
-    print(f"发生了其他错误: {e}")
+    print(f"\n❌ 发生了其他错误: {e}")
