@@ -11,7 +11,7 @@ class LNT_Encoder(nn.Module):
         :param hidden_dim: 隐藏层大小 (比如 64)
         :param z_dim: 最终输出的特征向量维度 (比如 16)
         """
-        super(LNT_Encoder, self).__init__()
+        super(LNT_Encoder, self).__init__() #me 初始化
 
         # 使用 LSTM 或 GRU 来提取时序特征
         # batch_first=True 意味着输入是 [Batch, Seq, Feature]
