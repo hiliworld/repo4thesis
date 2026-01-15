@@ -23,6 +23,7 @@ WINDOW_SIZE = 100
 FEATURE_DIM = 36
 LAMBDA_CL = 0.1
 PATIENCE = 10      # ✅ 新增：早停容忍度 (10轮不降就停)
+MIN_DELTA = 0.001  # ✅ 新增：哪怕你降了，但没降够 0.001，我也不认！
 
 # 自动选择设备
 if torch.cuda.is_available():
@@ -151,18 +152,21 @@ for epoch in range(EPOCHS):
     print(f"✨ Epoch [{epoch + 1}] Done | Time: {duration:.1f}s | Avg Loss: {avg_loss:.4f} (Avg CL: {avg_cl:.4f})")
 
     # === ✅ 早停逻辑 (Early Stopping) ===
-    if avg_loss < best_loss:
+    # === ✅ 升级版早停逻辑 ===
+    # 只有当 (当前Loss < 历史最佳 - 阈值) 时，才算有效进步
+    if avg_loss < (best_loss - MIN_DELTA):
         best_loss = avg_loss
         patience_counter = 0
-        # 保存表现最好的模型
         torch.save(model.state_dict(), save_path)
-        print(f"   💾 Loss Improved! Best model saved to: {save_path}")
+        print(f"   💾 Loss 有显著下降 (超过 {MIN_DELTA})! 模型已保存。")
+        
     else:
+        # 即使 avg_loss 比 best_loss 小一点点 (比如 0.0001)，只要没超过 MIN_DELTA，也算没进步
         patience_counter += 1
-        print(f"   ⚠️ Loss didn't improve ({patience_counter}/{PATIENCE})")
+        print(f"   ⚠️ Loss 进入平台期 ({patience_counter}/{PATIENCE}) - 当前: {avg_loss:.4f}, 最佳: {best_loss:.4f}")
         
         if patience_counter >= PATIENCE:
-            print(f"🛑 Early Stopping Triggered! Training stopped at epoch {epoch+1}.")
+            print(f"🛑 触发早停！模型在 {PATIENCE} 轮内没有显著提升 (>{MIN_DELTA})。")
             break
 
 print("="*50)
