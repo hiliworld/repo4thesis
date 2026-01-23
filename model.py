@@ -3,170 +3,175 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# === 组件 1: 位置编码 (Positional Embedding) ===
-# 作用: 给 Log 序列打上时间戳，让模型理解 "先后顺序"
+# === 组件 1: 位置编码 (保持不变) ===
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
         pe = torch.zeros(max_len, d_model).float()
         pe.require_grad = False
-
         position = torch.arange(0, max_len).float().unsqueeze(1)
         div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
-
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         return self.pe[:, :x.size(1)]
 
-# === 组件 2: 交叉注意力 (预埋) ===
-class CrossAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(embed_dim)
-        
-    def forward(self, query, key_value, key_padding_mask=None):
-        attn_out, _ = self.attn(query, key_value, key_value, key_padding_mask=key_padding_mask)
-        return self.norm(query + attn_out)
-
-# === 核心 1: Metric Encoder (TCN + Dynamic Graph) ===
-# 改进: 结合了 TCN 提取时序，Self-Attention 提取指标间依赖
-class MetricGATEncoder(nn.Module):
-    def __init__(self, input_dim=333, hidden_dim=64, window_size=20):
+# === 组件 2: Metric Encoder (架构升级: GAT -> GRU) ===
+# 【核心逻辑】使用 RNN 类结构来捕获时序的"突变"，而不是用 AvgPool 抹平它
+class MetricGRUEncoder(nn.Module):
+    def __init__(self, input_dim=333, hidden_dim=64, num_layers=2, dropout=0.1):
         super().__init__()
         
-        # A. 时序特征提取 (Temporal Convolution)
-        # 先把每个指标看作独立的时间序列，压缩时间维度 T=20 -> T=1
-        # 这就像给每个指标算了一个"加权特征值"
-        self.temporal_conv = nn.Sequential(
-            nn.Conv1d(in_channels=input_dim, out_channels=input_dim, 
-                      kernel_size=3, padding=1, groups=input_dim),
+        # 1. 特征投影: 把 333 维的原始指标先压缩一下，方便 GRU 吃
+        # 这一步相当于提取 spatial features
+        self.feature_proj = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1) # [B, 333, 20] -> [B, 333, 1]
+            nn.Dropout(dropout)
         )
         
-        # B. 维度投影
-        # 将每个指标的标量特征映射到高维空间，方便算 Attention
-        # 333 个节点，每个节点现在有 64 维的特征
-        self.feature_proj = nn.Linear(1, hidden_dim) 
+        # 2. 时序建模: GRU
+        # batch_first=True -> Input: [Batch, SeqLen, Dim]
+        self.gru = nn.GRU(
+            input_size=128, 
+            hidden_size=hidden_dim, 
+            num_layers=num_layers, 
+            batch_first=True, 
+            dropout=dropout if num_layers > 1 else 0
+        )
         
-        # C. 动态图注意力 (Dynamic Graph Learning)
-        # 这里虽然用的是 MultiheadAttention，但我们输入的 Sequence Length 是 333 (指标数量)
-        # 这意味着我们在计算 "指标 i" 和 "指标 j" 的相关性 -> 这就是 GAT 的本质！
-        self.graph_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
-        
-        # D. 读出层 (Readout)
+        # 3. 输出投影
         self.fc = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x, mask):
-        # x: [Batch, Window, 333] -> 转置为 [Batch, 333, Window]
-        x = x.permute(0, 2, 1) 
+    def forward(self, x, mask=None):
+        # x: [Batch, Window, MetricDim] = [B, 20, 333]
         
-        # 1. 时序压缩: [Batch, 333, 1]
-        # 每个指标变成了一个特征点
-        t_feat = self.temporal_conv(x)
-        
-        # 2. 特征投影: [Batch, 333, 1] -> [Batch, 333, 64]
-        # 现在我们有 333 个节点，每个节点由 64 维向量表示
-        nodes = self.feature_proj(t_feat)
-        
-        # 3. 图注意力交互 (Graph Interaction)
-        # 这一步让模型自动学习：CPU Load (Node i) 是否应该关注 Disk IO (Node j)
-        # 加上 residual connection 防止梯度消失
-        nodes_updated, _ = self.graph_attn(nodes, nodes, nodes)
-        nodes = nodes + nodes_updated
-        
-        # 4. Masked Pooling (图读出)
-        # 将 333 个节点的特征聚合成 1 个图特征向量
+        # 1. 预处理
         if mask is not None:
-            # mask: [Batch, 333] -> [Batch, 333, 1]
-            mask = mask.unsqueeze(-1)
-            nodes = nodes * mask # 屏蔽掉 Padding 的指标
-            valid_count = mask.sum(dim=1).clamp(min=1.0)
-            out = nodes.sum(dim=1) / valid_count # 平均池化
-        else:
-            out = nodes.mean(dim=1)
+            # 如果有 mask，把无效维度的值清零 (虽然 dataset 里应该处理过了)
+            x = x * mask.unsqueeze(1)
             
-        return self.fc(out)
+        # 2. 空间特征提取
+        x_emb = self.feature_proj(x) # [B, 20, 128]
+        
+        # 3. 时序演化 (捕捉突变)
+        # out: [B, 20, Hidden], hn: [Layers, B, Hidden]
+        out, _ = self.gru(x_emb)
+        
+        # 4. 取最后一个时间步 (Last Step)
+        # 代表了"读完这段波形后的最终状态"
+        last_step_feat = out[:, -1, :] # [B, 64]
+        
+        # 5. 最终映射
+        return self.norm(self.fc(last_step_feat))
 
-# === 核心 2: Log Encoder (Transformer + Positional) ===
-# 改进: 引入 Positional Embedding，彻底利用参考代码 log_model_v3.py 的优势
+# === 组件 3: Log Encoder (保持不变) ===
 class LogAttentionEncoder(nn.Module):
     def __init__(self, vocab_size, embed_dim=384, hidden_dim=64, pretrained_weights=None):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        
         if pretrained_weights is not None:
             print("🧠 [Model] Loading Pretrained Semantic Vectors...")
             self.embedding.weight.data.copy_(pretrained_weights)
-            self.embedding.weight.requires_grad = True 
+            self.embedding.weight.requires_grad = True # 允许微调
             
         self.proj = nn.Linear(embed_dim, hidden_dim)
-        
-        # 【关键升级】位置编码
+        self.count_proj = nn.Linear(vocab_size, hidden_dim)
         self.pos_encoder = PositionalEmbedding(hidden_dim)
         
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True, dim_feedforward=128)
+        # Log 依然用 Transformer，因为它更擅长处理语义组合
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True, dim_feedforward=128, dropout=0.1)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
         
         self.fc = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x, mask):
-        # x: [Batch, 50]
-        emb = self.embedding(x) # [B, 50, 384]
-        h = self.proj(emb)      # [B, 50, 64]
-        
-        # 注入位置信息：让模型知道日志发生的先后顺序
+    def forward(self, x, mask, log_count=None): 
+        emb = self.embedding(x)
+        h = self.proj(emb)
         h = h + self.pos_encoder(h)
         
-        # Transformer 处理
         padding_mask = (mask == 0)
         h = self.transformer_encoder(h, src_key_padding_mask=padding_mask)
         
-        # 聚合
+        # Pooling: 简单的加权平均
+        mask_expanded = mask.unsqueeze(-1)
+        sum_out = (h * mask_expanded).sum(dim=1)
         mask_sum = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        sum_out = (h * mask.unsqueeze(-1)).sum(dim=1)
-        avg_out = sum_out / mask_sum
+        semantic_feat = sum_out / mask_sum 
         
-        return self.fc(avg_out)
+        final_feat = self.fc(semantic_feat)
+        
+        if log_count is not None:
+            count_feat = self.count_proj(log_count)
+            count_feat = F.relu(count_feat)
+            final_feat = final_feat + count_feat
+            
+        return self.norm(final_feat)
 
-# === 核心 3: UAC 主模型 ===
+# === 组件 4: UAC 主模型 (适配新 Encoder) ===
 class UACModel(nn.Module):
-    def __init__(self, metric_dim=333, log_vocab_size=1000, log_weights=None):
+    def __init__(self, metric_dim=333, log_vocab_size=1000, embed_dim=64, log_weights=None):
         super().__init__()
         
-        self.metric_encoder = MetricGATEncoder(input_dim=metric_dim)
-        self.log_encoder = LogAttentionEncoder(vocab_size=log_vocab_size, pretrained_weights=log_weights)
+        # 【修改】使用 GRU Encoder
+        self.metric_encoder = MetricGRUEncoder(input_dim=metric_dim, hidden_dim=embed_dim)
+        self.log_encoder = LogAttentionEncoder(vocab_size=log_vocab_size, hidden_dim=embed_dim, pretrained_weights=log_weights)
         
-        # 预留 Upgrade 1 接口
-        self.cross_attn = CrossAttention(embed_dim=64)
+        self.mix_norm = nn.LayerNorm(embed_dim)
         
         self.metric_projector = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.Linear(embed_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
             nn.ReLU(),
-            nn.Linear(64, 64)
+            nn.Linear(embed_dim, embed_dim)
         )
         
         self.log_projector = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.Linear(embed_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
             nn.ReLU(),
-            nn.Linear(64, 64)
+            nn.Linear(embed_dim, embed_dim)
         )
 
-    def forward(self, metric_seq, metric_mask, log_seq, log_mask):
-        z_m = self.metric_encoder(metric_seq, metric_mask)
-        z_l = self.log_encoder(log_seq, log_mask)
+    def forward(self, metric_seq, metric_mask, log_seq, log_mask, log_count=None, mixup_alpha=None):
+        z_m = self.metric_encoder(metric_seq, metric_mask) # [B, 64]
+        z_l = self.log_encoder(log_seq, log_mask, log_count) # [B, 64]
         
+        batch_size = z_m.size(0)
+        aux_info = {'mixup_active': False}
+
+        if self.training and mixup_alpha is not None and mixup_alpha > 0 and batch_size > 1:
+            beta_dist = torch.distributions.Beta(
+                torch.tensor([mixup_alpha], device=z_m.device), 
+                torch.tensor([mixup_alpha], device=z_m.device)
+            )
+            lam = beta_dist.sample().item() 
+            lam = max(min(lam, 0.99), 0.01)
+            
+            index = torch.randperm(batch_size, device=z_m.device)
+            
+            z_m_mixed = lam * z_m + (1 - lam) * z_m[index]
+            z_l_mixed = lam * z_l + (1 - lam) * z_l[index]
+            
+            z_m = self.mix_norm(z_m_mixed)
+            z_l = self.mix_norm(z_l_mixed)
+            
+            aux_info = {
+                'mixup_active': True,
+                'lam': lam,
+                'perm_index': index
+            }
+
         p_m = self.metric_projector(z_m)
         p_l = self.log_projector(z_l)
         
         p_m = F.normalize(p_m, dim=1)
         p_l = F.normalize(p_l, dim=1)
         
-        return p_m, p_l
+        return p_m, p_l, aux_info

@@ -19,10 +19,11 @@ CONFIG = {
     'batch_size': 256,
     'metric_window': 20,
     'metric_dim': 333,
-    'embed_dim': 64,  # V4 模型参数
+    'embed_dim': 64,  # V6 模型参数
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'model_path': 'checkpoints/uac_model_best.pth',
-    # 【关键】这里建议保持较小的窗口，依靠 PA 来解决 F1 问题
+    
+    # 【关键】保持较小的窗口，依靠 PA 来解决 F1 问题
     'anomaly_window_seconds': 60 * 1  # 1分钟窗口
 }
 
@@ -32,27 +33,18 @@ def apply_point_adjustment(y_true, y_scores):
     实现 Point Adjustment 策略：
     如果一个故障区间内有任意时刻被预测为异常（分数高），
     则整个区间都被视为检测成功（将区间内的分数全部提升为该区间的最大分数）。
-    这允许我们使用标准 API 计算最佳阈值。
     """
     y_scores_adjusted = y_scores.copy()
     
     # 找到 y_true 中所有的连续异常片段
-    # 使用 diff 找到 0->1 和 1->0 的变化点
     changes = np.diff(np.r_[0, y_true, 0])
     starts = np.where(changes == 1)[0]
     ends = np.where(changes == -1)[0]
     
-    # 遍历每个故障片段
     for start, end in zip(starts, ends):
-        # 找到该片段内模型预测的最大分数
-        # 注意: end 是开区间，所以取切片 [start:end]
         segment_scores = y_scores[start:end]
         if len(segment_scores) == 0: continue
-            
         max_score = np.max(segment_scores)
-        
-        # 将整个片段的分数修正为最大分数
-        # 逻辑：只要这一段里有一个点爆了，就认为模型对这一整段都有信心
         y_scores_adjusted[start:end] = max_score
         
     return y_scores_adjusted
@@ -199,7 +191,10 @@ def evaluate():
                 b_mm = mask_tensor.unsqueeze(0).repeat(real_batch_size, 1).to(CONFIG['device'])
                 
                 with torch.no_grad():
-                    p_m, p_l = model(b_m, b_mm, b_l, b_lm)
+                    # 【核心修复】接收 3 个返回值，忽略最后一个 aux_info
+                    p_m, p_l, _ = model(b_m, b_mm, b_l, b_lm, mixup_alpha=None)
+                    
+                    # 异常分数 = 1 - Cosine Similarity
                     scores = 1.0 - (p_m * p_l).sum(dim=1)
                     file_scores.extend(scores.cpu().numpy())
             
@@ -244,11 +239,9 @@ def evaluate():
     print("\n🚀 [2. Point Adjustment Metrics (Event-wise)] - 运维实战模式")
     print("   -> 正在应用 PA 策略修正分数...")
     
-    # 核心步骤：修正分数
     all_scores_pa = apply_point_adjustment(all_labels, all_scores)
     
     try:
-        # 使用修正后的分数计算 AUC 和 F1
         auc_pa = roc_auc_score(all_labels, all_scores_pa)
         prec_pa, rec_pa, thresh_pa = precision_recall_curve(all_labels, all_scores_pa)
         f1_pa = 2 * (prec_pa * rec_pa) / (prec_pa + rec_pa + 1e-8)
@@ -262,8 +255,6 @@ def evaluate():
         
     except Exception as e:
         print(f"   ⚠️ PA 计算失败: {e}")
-        import traceback
-        traceback.print_exc()
 
 if __name__ == "__main__":
     evaluate()
