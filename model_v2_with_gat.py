@@ -1,68 +1,77 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from lnt_encoder import LNT_Conv_Encoder
 
-# === 1. 导入组件 ===
-try:
-    from lnt_encoder import LNT_Conv_Encoder
-    from adaptive_gat import SpatialAttentionLayer  # <--- ✅ 新增：导入刚才写好的文件
-except ImportError:
-    print("❌ 错误：找不到 lnt_encoder.py 或 adaptive_gat.py")
-    exit()
-
-# (SimpleGATLayer 可以删掉了，或者留着做纪念，反正我们不用它了)
-
-# === 2. 最终模型 (完全体) ===
 class MyFinalModel(nn.Module):
-    def __init__(self, num_features=36, window_size=100, hidden_dim=64, z_dim=16):
+    def __init__(self, config):
         """
-        :param z_dim: 编码后的特征维度 (LNT 输出维度)
+        通用模型：目前仅启用数值(Metric)模式
         """
         super(MyFinalModel, self).__init__()
         
-        # A. LNT 编码器 (Step 7 已完成)
-        # 作用：提取局部时序特征
-        self.lnt_encoder = LNT_Conv_Encoder(input_dim=1, z_dim=z_dim)
+        # 强制默认为 metric，或者从配置读
+        self.modality = config['dataset'].get('modality', 'metric')
+        self.hidden_dim = config['model']['hidden_dim']
+        
+        print(f"🤖 初始化模型模式: {self.modality.upper()}")
 
-        # B. 自适应空间注意力层 (Step 9 核心升级) <--- ✅ 修改点
-        # 作用：自动学习传感器之间的关联图
-        # 我们让 output_dim = z_dim，保持维度一致方便计算
-        self.gat_layer = SpatialAttentionLayer(
-            input_dim=z_dim, 
-            output_dim=z_dim, 
-            num_heads=4,    # 使用 4 个头，分别关注不同的关系模式
-            dropout=0.2
-        )
+        # ==========================
+        # 🏗️ 分支 A: 数值型 (SMD/SWaT)
+        # ==========================
+        if self.modality == 'metric':
+            # 这里的 input_dim 会在 step8 中被动态覆盖为 37
+            self.feature_dim = config['dataset'].get('input_dim', 38)
+            self.window_size = config['dataset']['window_size']
+            
+            # 【修复点】正确实例化 LNT_Conv_Encoder
+            # LNT_Conv_Encoder 只接受 input_dim (默认1) 和 z_dim
+            # 注意：它的 input_dim 指的是卷积的通道数，而在 forward 里我们把它reshape成了 (B*N, 1, W)
+            # 所以这里的 input_dim 应该是 1
+            self.metric_encoder = LNT_Conv_Encoder(
+                input_dim=1, 
+                z_dim=config['model']['z_dim']
+            )
+            
+            # 预测头 (Forecasting)
+            # Encoder 输出 z 的维度是 [Batch, Nodes, z_dim]
+            # 我们需要把 z_dim 映射回 1 (预测下一个值) 或者其他逻辑
+            # 原来的代码可能是：self.pred_head = nn.Linear(self.hidden_dim, self.feature_dim)
+            # 但现在 metric_encoder 输出的是 [B, N, z_dim]
+            
+            # 让我们看看 forward 怎么写的：
+            # z = self.metric_encoder(x) -> [B, N, z_dim]
+            
+            # 现在的 pred_head 需要把 z_dim 变成 1 (预测该 Sensor 的下一个值)
+            # 输入: [B, N, z_dim] -> Linear -> [B, N, 1] -> squeeze -> [B, N]
+            self.pred_head = nn.Linear(config['model']['z_dim'], 1)
+            
+            # 重建头 (Reconstruction)
+            # 输入: [B, N, z_dim] -> Linear -> [B, N, Window]
+            self.recon_head = nn.Linear(config['model']['z_dim'], self.window_size)
 
-        # C. 预测头
-        self.pred_head = nn.Linear(num_features * z_dim, num_features)
-
-        # D. 重建头
-        self.recon_decoder = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, window_size)
-        )
+        else:
+            raise ValueError(f"Unknown modality: {self.modality}")
 
     def forward(self, x):
-        # x: [Batch, 100, 36]
-        batch_size, seq_len, num_features = x.shape
+        if self.modality == 'metric':
+            # --- 数值路径 ---
+            # x: [Batch, Window, Features] -> [B, W, N]
+            # 注意：PyTorch RNN 习惯 [B, W, N]，但 LNT Encoder 需要 [B, W, N]
+            
+            # 1. 编码
+            # z: [Batch, Nodes, z_dim]
+            z = self.metric_encoder(x) 
+            
+            # 2. 任务 A: 预测下一个点 (Forecasting)
+            # [B, N, z_dim] -> [B, N, 1] -> [B, N]
+            pred_next = self.pred_head(z).squeeze(-1)
+            
+            # 3. 任务 B: 重建整个窗口 (Reconstruction)
+            # [B, N, z_dim] -> [B, N, W] -> Permute -> [B, W, N]
+            recon_window = self.recon_head(z).permute(0, 2, 1)
+            
+            return pred_next, recon_window, z
 
-        # 1. LNT 编码
-        # out: [Batch, 36, 16]
-        node_features = self.lnt_encoder(x)
-
-        # 2. 自适应 GAT 融合 <--- ✅ 修改点
-        # out: [Batch, 36, 16] (特征融合后)
-        # attn: [Batch, 36, 36] (学习到的关系图)
-        gat_features, attn_weights = self.gat_layer(node_features)
-
-        # 3. 预测 (使用融合了空间信息的特征)
-        pred_next = self.pred_head(gat_features.view(batch_size, -1))
-
-        # 4. 重建 (对每个特征独立重建)
-        gat_flat = gat_features.view(batch_size * num_features, -1)
-        recon_flat = self.recon_decoder(gat_flat)
-        recon_window = recon_flat.view(batch_size, num_features, seq_len).permute(0, 2, 1)
-
-        return pred_next, recon_window, attn_weights
+        else:
+            raise ValueError(f"Unknown modality: {self.modality}")

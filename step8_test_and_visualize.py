@@ -1,221 +1,120 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-import pandas as pd
 import numpy as np
 import os
+import yaml
 from tqdm import tqdm
-# 引入 f1_score 计算
-from sklearn.metrics import roc_auc_score, f1_score
+# from sklearn.metrics import roc_auc_score # 暂时不需要，因为还没 Label
 
 # === 导入自定义模块 ===
 try:
-    from step4_windowing import SMDWindowDataset
+    from data_factory import get_dataloaders
     from model_v2_with_gat import MyFinalModel
 except ImportError:
-    print("❌ 错误：找不到自定义模块，请检查文件名。")
+    print("❌ 错误：找不到自定义模块。")
     exit()
 
 # === 配置参数 ===
-WINDOW_SIZE = 100
-BATCH_SIZE = 256
-FEATURE_DIM = 36
-# ✅ 确保加载的是完全体模型
-MODEL_NAME = "my_trained_model_adaptive.pth" 
+MODEL_NAME = "my_trained_model_adaptive.pth"
+CONFIG_FILE = "config.yaml"
 
 # 设备配置
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-
 print(f"🔥 当前计算设备: {DEVICE}")
 
 # ==========================================
-# 1. 准备路径
+# 1. 准备数据
 # ==========================================
-base_dir = os.path.dirname(os.path.abspath(__file__))
-test_data_dir = os.path.join(base_dir, 'data', 'ServerMachineDataset', 'test')
-test_label_dir = os.path.join(base_dir, 'data', 'ServerMachineDataset', 'test_label')
-model_path = os.path.join(base_dir, MODEL_NAME)
-
-test_files = sorted([f for f in os.listdir(test_data_dir) if f.endswith('.txt')])
-print(f"📂 发现 {len(test_files)} 个测试文件。")
+print("📂 正在通过工厂加载测试数据...")
+try:
+    # get_dataloaders 返回: train_loader, val_loader, feature_dim
+    # 我们这里只需要 test_loader (即 val_loader) 和 维度
+    _, test_loader, feature_dim = get_dataloaders(CONFIG_FILE)
+    
+    print(f"✅ 数据加载成功！特征维度: {feature_dim}")
+    print(f"   测试集 Batch 数: {len(test_loader)}")
+except Exception as e:
+    print(f"❌ 数据加载失败: {e}")
+    exit()
 
 # ==========================================
 # 2. 加载模型
 # ==========================================
-if not os.path.exists(model_path):
-    print(f"❌ 错误：找不到模型文件 {model_path}")
-    print("   请确保 Step 9 训练完成并保存了模型。")
-    exit()
+# 读取原始配置
+with open(CONFIG_FILE, 'r') as f:
+    config = yaml.safe_load(f)
+
+# 【核心修复】：更新 config 中的 input_dim 为实际加载到的维度 (37)
+# 这样模型初始化时就能拿到正确的维度，而不是默认的 38
+config['dataset']['input_dim'] = feature_dim
+config['dataset']['modality'] = 'metric' 
 
 print(f"🤖 正在加载模型: {MODEL_NAME} ...")
-model = MyFinalModel(num_features=FEATURE_DIM, window_size=WINDOW_SIZE, hidden_dim=64, z_dim=16).to(DEVICE)
-model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+
+try:
+    # 【核心修复】：直接传入 config 字典，而不是分散的参数
+    model = MyFinalModel(config).to(DEVICE)
+    
+    # 加载权重
+    model.load_state_dict(torch.load(MODEL_NAME, map_location=DEVICE))
+    print("✅ 模型权重加载成功！")
+except TypeError as e:
+    print(f"❌ 模型初始化参数错误: {e}")
+    exit()
+except Exception as e:
+    print(f"❌ 模型加载失败: {e}")
+    exit()
+
 model.eval()
 
 # ==========================================
-# ✅ 核心函数：Point Adjustment (PA)
+# 3. 全量推理 (Inference)
 # ==========================================
-def point_adjustment(preds, labels):
-    """
-    PA 策略实现：
-    如果模型在一个连续的异常片段中正确检测到了哪怕 1 个点，
-    我们就把这整个片段的所有点的预测结果都置为 1 (视为检测成功)。
-    """
-    adjusted_preds = preds.copy()
-    if np.sum(labels) == 0:
-        return adjusted_preds
-    
-    # 找到所有异常片段的起止点
-    # diff 为 1 的位置是开始，-1 的位置是结束
-    diff = np.diff(np.concatenate(([0], labels, [0])))
-    starts = np.where(diff == 1)[0]
-    ends = np.where(diff == -1)[0]
-    
-    for start, end in zip(starts, ends):
-        # 只要该片段内有一个点预测为 1
-        if np.sum(preds[start:end]) > 0:
-            adjusted_preds[start:end] = 1
-            
-    return adjusted_preds
+all_scores = []
+criterion = nn.MSELoss(reduction='none')
 
-# ==========================================
-# ✅ 核心函数：搜索最佳 F1 (PA-F1)
-# ==========================================
-def get_best_f1_with_pa(scores, labels, step_num=100):
-    """
-    遍历可能的阈值，应用 PA，找到最高的 F1 分数
-    """
-    # 生成 100 个候选阈值 (从 0% 到 100% 分位数)
-    # 这样比遍历所有分数要快得多，精度也足够
-    min_score, max_score = np.min(scores), np.max(scores)
-    # 稍微放宽一点边界
-    thresholds = np.linspace(min_score, max_score, step_num)
-    
-    best_f1 = 0
-    best_precision = 0
-    best_recall = 0
-    
-    # 遍历阈值
-    for th in thresholds:
-        # 1. 生成原始二分类预测
-        preds = (scores > th).astype(int)
+print("🚀 开始推理...")
+with torch.no_grad():
+    for x in tqdm(test_loader):
+        x = x.to(DEVICE)
         
-        # 2. 如果预测全是0，跳过 (防止除0错误)
-        if np.sum(preds) == 0:
-            continue
-            
-        # 3. 应用 Point Adjustment
-        adjusted_preds = point_adjustment(preds, labels)
+        # 前向传播
+        pred_next, recon_window, _ = model(x)
         
-        # 4. 计算 F1
-        f1 = f1_score(labels, adjusted_preds)
+        # === 计算异常分 ===
+        # 1. 预测误差 (只看最后一个点)
+        target_next = x[:, -1, :]
+        loss_pred = torch.mean((pred_next - target_next) ** 2, dim=1)
         
-        if f1 > best_f1:
-            best_f1 = f1
-            # 顺便记录下此时的 P 和 R，写论文可能要用
-            # best_precision = precision_score(labels, adjusted_preds)
-            # best_recall = recall_score(labels, adjusted_preds)
-            
-    return best_f1
+        # 2. 重建误差 (整个窗口取平均)
+        loss_recon = torch.mean((recon_window - x) ** 2, dim=(1, 2))
+        
+        # 3. 综合得分
+        score = loss_pred + loss_recon
+        
+        all_scores.append(score.cpu().numpy())
+
+all_scores = np.concatenate(all_scores)
 
 # ==========================================
-# 3. 单文件评估逻辑
+# 4. 结果分析
 # ==========================================
-def evaluate_one_file(filename):
-    file_path = os.path.join(test_data_dir, filename)
-    label_path = os.path.join(test_label_dir, filename)
-    
-    dataset = SMDWindowDataset(file_path, window_size=WINDOW_SIZE)
-    # drop_last=False 保证测试数据不丢失
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
-    
-    try:
-        raw_labels = pd.read_csv(label_path, header=None).values.flatten()
-        labels = raw_labels[WINDOW_SIZE-1:]
-    except:
-        return None, None, "No Label"
+print("\n" + "="*50)
+print("📊 测试概览")
+print("="*50)
+print(f"测试样本总数: {len(all_scores)}")
+print(f"异常分范围: [{np.min(all_scores):.4f}, {np.max(all_scores):.4f}]")
+print(f"异常分均值: {np.mean(all_scores):.4f}")
 
-    if len(labels) == 0:
-        return None, None, "Empty Label"
-
-    criterion = nn.MSELoss(reduction='none')
-    anomaly_scores = []
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            x = batch.to(DEVICE)
-            target_next = x[:, -1, :] 
-            target_window = x         
-
-            pred_next, recon_window, _ = model(x)
-            
-            loss_forecast = torch.mean(criterion(pred_next, target_next), dim=1)
-            loss_recon = torch.mean(criterion(recon_window[:, -1, :], target_window[:, -1, :]), dim=1)
-            
-            total_score = loss_forecast + loss_recon
-            anomaly_scores.extend(total_score.cpu().numpy())
-            
-    anomaly_scores = np.array(anomaly_scores)
-    
-    # 对齐
-    min_len = min(len(labels), len(anomaly_scores))
-    anomaly_scores = anomaly_scores[:min_len]
-    labels = labels[:min_len]
-    
-    return labels, anomaly_scores, "OK"
-
-# ==========================================
-# 4. 主循环
-# ==========================================
-results = []
-print("\n🚀 开始全量测试 (含 Point Adjustment)...")
-
-for filename in tqdm(test_files):
-    labels, scores, status = evaluate_one_file(filename)
-    
-    if status != "OK":
-        continue
-        
-    if np.sum(labels) == 0:
-        continue
-        
-    try:
-        # 计算 AUC (AUC 不受 PA 影响，直接算)
-        auc = roc_auc_score(labels, scores)
-        
-        # 计算 PA-F1 (这是改动的核心)
-        best_f1_pa = get_best_f1_with_pa(scores, labels)
-        
-        results.append({
-            "File": filename,
-            "AUC": auc,
-            "Best_F1_PA": best_f1_pa  # 标记为 PA 版本
-        })
-    except Exception as e:
-        print(f"❌ 计算指标出错 {filename}: {e}")
-
-# ==========================================
-# 5. 输出报告
-# ==========================================
-if len(results) > 0:
-    df_res = pd.DataFrame(results)
-    
-    print("\n" + "="*50)
-    print("📊 最终测试报告 (Point Adjusted)")
-    print("="*50)
-    print(f"测试机器数量: {len(df_res)}")
-    print(f"平均 AUC        : {df_res['AUC'].mean():.4f}")
-    print(f"平均 Best F1 (PA): {df_res['Best_F1_PA'].mean():.4f}")
-    print("-" * 50)
-    print("表现最好的 3 个机器:")
-    print(df_res.sort_values(by="Best_F1_PA", ascending=False).head(3))
-    print("-" * 50)
-    
-    csv_path = os.path.join(base_dir, "final_test_results_pa.csv")
-    df_res.to_csv(csv_path, index=False)
-    print(f"📝 结果已保存: {csv_path}")
-    
-else:
-    print("❌ 无有效结果。")
+# 画图
+try:
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 5))
+    plt.hist(all_scores, bins=50, color='blue', alpha=0.7)
+    plt.title("Anomaly Score Distribution")
+    plt.xlabel("Score")
+    plt.ylabel("Count")
+    plt.savefig("test_score_dist.png")
+    print("✅ 分布图已保存至 test_score_dist.png")
+except:
+    pass

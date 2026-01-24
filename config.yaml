@@ -1,38 +1,37 @@
 # ==========================================
-# 🎛️ 智能配置 (Smart Config)
+# 🎛️ 智能配置 (Smart Config) - 修复版
 # ==========================================
 
 dataset:
-  name: "Generic" # 不再区分 SMD/SWaT，统称通用数据
-  # 数据地址
+  name: "SMD"       # 名字改成 SMD 比较直观
   train_file: "./data/ServerMachineDataset/train/"
   test_file: "./data/ServerMachineDataset/test/"
-  # 模态开关 (metric 或 log)
-  modality: "log"
+  
+  # 【关键修改】必须改成 metric，因为 SMD 是指标数据
+  modality: "metric"
 
-
-  # 只有这一个是必须告诉机器的：文件长啥样？
   format:
-    header: null       # 无表头写 null，有表头写 0
-    sep: ","           # 分隔符: "," 或 "\s+" (空格)
-    label_col: null    # 如果数据里混了标签，告诉我是第几列 (比如 -1)，没有写 null
+    header: null       
+    sep: ","          
+    label_col: null    
     pattern: "*.txt"
 
-  # === 核心升级：自动清洗开关 ===
+  # === 自动清洗 ===
   cleaning:
-    auto_clean: true        # 总开关
-    drop_constant: true     # 自动扔掉方差为 0 的列
-    drop_high_nan: 0.5      # 扔掉缺失率超过 50% 的列
-    fill_nan: "linear"      # 缺失值填充方式: linear / mean / 0
+    auto_clean: true        
+    drop_constant: true     
+    drop_high_nan: 0.5      
+    fill_nan: "linear"      
 
   # 预处理
   window_size: 100
   normalization: "minmax"
-# HDFS 特有配置
-  vocab_size: 397     # 从 step15 的输出填入 (396 + 1)
-  embedding_dim: 16   # 把每个整数变成 16 维向量
+  
+  # 下面这些 Log 配置在 metric 模式下会被忽略，留着没事
+  vocab_size: 397     
+  embedding_dim: 16   
   max_len: 50
-# 模型和训练配置保持不变...
+
 model:
   hidden_dim: 64
   z_dim: 16
