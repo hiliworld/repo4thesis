@@ -38,6 +38,6 @@ model:
 
 train:
   batch_size: 64
-  epochs: 20
+  epochs: 50
   lr: 0.001
   patience: 5
