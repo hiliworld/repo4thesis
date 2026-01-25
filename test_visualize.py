@@ -21,7 +21,7 @@ except ImportError as e:
 CONFIG_FILE = "config.yaml"
 MODEL_NAME = "best_model.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_DIR = "diagnosis_results_final"
+OUTPUT_DIR = "diagnosis_results_errors" # 修改输出目录以免混淆
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 路径硬编码
@@ -56,11 +56,49 @@ def get_best_threshold(scores, labels):
     best_idx = np.argmax(f1_scores)
     return thresholds[best_idx], f1_scores[best_idx]
 
+def select_top_k_events(indices, scores, k=10, min_dist=500, mode='max'):
+    """
+    [新功能] 从候选索引中选择 K 个最具代表性的独立事件
+    避免选出的 10 个点都挤在一起
+    :param mode: 'max' 选分数最高的(误报), 'min' 选分数最低的(漏报)
+    """
+    if len(indices) == 0:
+        return []
+
+    target_scores = scores[indices]
+    
+    # 排序
+    if mode == 'max':
+        # 降序：分数越高越严重 (误报之王)
+        sorted_idx_positions = np.argsort(target_scores)[::-1]
+    else:
+        # 升序：分数越低越严重 (漏报之王：模型觉得特正常)
+        sorted_idx_positions = np.argsort(target_scores)
+        
+    sorted_indices = indices[sorted_idx_positions]
+    
+    selected_indices = []
+    for idx in sorted_indices:
+        if len(selected_indices) >= k:
+            break
+        
+        # 检查是否与已选的太近 (去重)
+        is_close = False
+        for selected in selected_indices:
+            if abs(idx - selected) < min_dist:
+                is_close = True
+                break
+        
+        if not is_close:
+            selected_indices.append(idx)
+            
+    return selected_indices
+
 def plot_final_diagnosis(mat_orig, mat_recon, mat_pred, 
                          scores, labels, threshold, 
                          start_idx, length=500, title="Diagnosis"):
     """
-    三图流绘制：Recon, Pred, Score+Threshold
+    三图流绘制
     """
     end_idx = min(start_idx + length, len(scores))
     if start_idx >= end_idx: return
@@ -73,67 +111,58 @@ def plot_final_diagnosis(mat_orig, mat_recon, mat_pred,
     s_score = scores[start_idx:end_idx]
     s_label = labels[start_idx:end_idx]
     
-    # === 智能特征选择 ===
-    # 找出这段时间内误差最大的特征
+    # 智能特征选择
     err_matrix = (s_pred - s_orig)**2 + (s_recon - s_orig)**2
     feat_errors = np.mean(err_matrix, axis=0)
     top_feat_idx = np.argmax(feat_errors)
     
-    # 提取该特征的波形
     f_orig = s_orig[:, top_feat_idx]
     f_recon = s_recon[:, top_feat_idx]
     f_pred = s_pred[:, top_feat_idx]
     
-    # === 绘图 ===
+    # 绘图
     fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
     
-    # Row 1: Reconstruction Check
+    # Row 1: Reconstruction
     axes[0].plot(time_steps, f_orig, color='black', alpha=0.6, label=f'Original (Feat {top_feat_idx})')
     axes[0].plot(time_steps, f_recon, color='green', linestyle='--', linewidth=1.5, label='Reconstruction')
-    axes[0].set_title(f"Reconstruction Fit (Feature {top_feat_idx})")
+    axes[0].set_title(f"{title} | Recon Fit (Feat {top_feat_idx})")
     axes[0].legend(loc='upper right')
     axes[0].grid(True, alpha=0.3)
     
-    # Row 2: Prediction Check
-    axes[0].sharex(axes[1])
-    axes[1].plot(time_steps, f_orig, color='black', alpha=0.6, label=f'Original (Feat {top_feat_idx})')
+    # Row 2: Prediction
+    axes[1].plot(time_steps, f_orig, color='black', alpha=0.6, label=f'Original')
     axes[1].plot(time_steps, f_pred, color='orange', linestyle=':', linewidth=2, label='Prediction')
-    axes[1].set_title(f"Prediction Fit (Feature {top_feat_idx})")
+    axes[1].set_title(f"{title} | Pred Fit (Feat {top_feat_idx})")
     axes[1].legend(loc='upper right')
     axes[1].grid(True, alpha=0.3)
     
-    # Row 3: Decision View (Score vs Threshold)
-    # 不做归一化，直接画原始分数，这样阈值才有意义
+    # Row 3: Decision
     axes[2].plot(time_steps, s_score, color='blue', linewidth=1.5, label='Anomaly Score')
-    
-    # 画阈值线
     axes[2].axhline(y=threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold ({threshold:.4f})')
-    
-    # 画 Ground Truth 阴影
     axes[2].fill_between(time_steps, 0, s_score.max(), where=(s_label > 0.5), 
                          color='red', alpha=0.2, label='Ground Truth')
     
     axes[2].set_title("Anomaly Score & Decision Threshold")
     axes[2].legend(loc='upper right')
-    axes[2].set_xlabel("Time Steps")
     axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
     save_path = f"{OUTPUT_DIR}/{title}_idx{start_idx}.png"
     plt.savefig(save_path)
     plt.close()
+    print(f"   📸 Saved: {title}")
 
 def main():
-    print(f"🔥 Final Visualizer (3-Panel + Threshold) | Device: {DEVICE}")
+    print(f"🔥 Error Analysis Visualizer | Device: {DEVICE}")
     
-    # 1. 准备数据
+    # 1. 准备数据 & 模型
     try:
         _, test_loader, feature_dim = get_dataloaders(CONFIG_FILE)
     except Exception as e:
         print(f"❌ 数据加载失败: {e}")
         return
 
-    # 2. 准备模型
     with open(CONFIG_FILE, 'r') as f:
         config = yaml.safe_load(f)
     config['dataset']['input_dim'] = feature_dim
@@ -146,39 +175,34 @@ def main():
     model.eval()
     
     # 3. 全量推理
-    print("🚀 Running Inference to calculate Global Threshold...")
-    orig_list, recon_list, pred_list = [], [], []
-    score_list = []
+    print("🚀 Running Inference...")
+    orig_list, recon_list, pred_list, score_list = [], [], [], []
     
     with torch.no_grad():
         for x in tqdm(test_loader, desc="Inference"):
             x = x.to(DEVICE)
             pred_next, recon_window, _ = model(x)
             
-            # Dimensions
             target_curr = x[:, -1, :]
             recon_curr  = recon_window[:, -1, :]
             pred_curr   = pred_next
             if pred_curr.dim() == 3: pred_curr = pred_curr.squeeze(-1)
             
-            # Score
             l_pred = torch.mean((pred_curr - target_curr) ** 2, dim=1)
             l_recon = torch.mean((recon_curr - target_curr) ** 2, dim=1)
             score = l_pred + l_recon
             
-            # Store
             orig_list.append(target_curr.cpu().numpy())
             recon_list.append(recon_curr.cpu().numpy())
             pred_list.append(pred_curr.cpu().numpy())
             score_list.append(score.cpu().numpy())
             
-    # Concat
     mat_orig  = np.concatenate(orig_list, axis=0)
     mat_recon = np.concatenate(recon_list, axis=0)
     mat_pred  = np.concatenate(pred_list, axis=0)
     scores    = np.concatenate(score_list, axis=0)
     
-    # 4. 加载标签 & 对齐
+    # 4. 标签对齐
     labels = load_labels(config)
     if labels is None: return
     
@@ -189,43 +213,44 @@ def main():
     scores = scores[:min_len]
     labels = labels[:min_len]
     
-    # 5. 计算最佳阈值 (关键步骤)
-    print("⚖️  正在计算最佳 F1 阈值...")
+    # 5. 计算阈值
+    print("⚖️  Calculating Best Threshold...")
     best_thresh, best_f1 = get_best_threshold(scores, labels)
-    print(f"   🏆 Best Threshold: {best_thresh:.6f} (F1: {best_f1:.4f})")
+    print(f"   🏆 Threshold: {best_thresh:.6f} | Best F1: {best_f1:.4f}")
     
-    # 6. 绘图循环
-    # A. 真实故障
-    diff = np.diff(labels, prepend=0)
-    starts = np.where(diff == 1)[0]
-    print(f"🔎 绘制前 5 个真实故障...")
-    for i, start in enumerate(starts[:5]):
+    # ==========================================
+    # 🔍 核心逻辑：Top-K 错误分析
+    # ==========================================
+    
+    # --- A. 分析误报 (False Positives) ---
+    # 定义：Label=0 但 Score > Threshold
+    fp_indices = np.where((labels == 0) & (scores > best_thresh))[0]
+    top_fps = select_top_k_events(fp_indices, scores, k=10, mode='max')
+    
+    print(f"\n🔎 正在绘制 Top 10 严重误报 (False Positives)...")
+    if len(top_fps) == 0:
+        print("   🎉 完美！没有误报。")
+    for i, idx in enumerate(top_fps):
         plot_final_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
                              threshold=best_thresh,
-                             start_idx=max(0, start - 50), 
-                             title=f"True_Anomaly_{i+1}")
-                             
-    # B. 误报 (Top False Positives)
-    # 定义误报：Label=0 且 Score > Threshold
-    # 我们找 Score 超过 Threshold 最多的几个点
-    fp_mask = (labels == 0) & (scores > best_thresh)
-    fp_indices = np.where(fp_mask)[0]
-    
-    if len(fp_indices) > 0:
-        # 按分数排序，取最大的
-        fp_scores = scores[fp_indices]
-        sorted_fp_idx = fp_indices[np.argsort(fp_scores)[-3:]] # Top 3
-        
-        print(f"🔎 绘制 Top 3 误报 (超过阈值)...")
-        for i, idx in enumerate(sorted_fp_idx):
-             plot_final_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
-                                  threshold=best_thresh,
-                                  start_idx=max(0, idx - 250), 
-                                  title=f"False_Positive_{i+1}")
-    else:
-        print("🎉 厉害！没有发现误报 (没有 Label=0 且 Score>Threshold 的点)")
+                             start_idx=max(0, idx - 250), 
+                             title=f"FP_Rank{i+1}_Score{scores[idx]:.2f}")
 
-    print(f"\n✅ 图片已保存至 {OUTPUT_DIR}/")
+    # --- B. 分析漏报 (False Negatives) ---
+    # 定义：Label=1 但 Score <= Threshold
+    fn_indices = np.where((labels == 1) & (scores <= best_thresh))[0]
+    top_fns = select_top_k_events(fn_indices, scores, k=10, mode='min')
+    
+    print(f"\n🔎 正在绘制 Top 10 严重漏报 (False Negatives)...")
+    if len(top_fns) == 0:
+        print("   🎉 完美！没有漏报。")
+    for i, idx in enumerate(top_fns):
+        plot_final_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
+                             threshold=best_thresh,
+                             start_idx=max(0, idx - 250), 
+                             title=f"FN_Rank{i+1}_Score{scores[idx]:.2f}")
+
+    print(f"\n✅ 分析完成！请查看 {OUTPUT_DIR}/ 文件夹。")
 
 if __name__ == "__main__":
     main()
