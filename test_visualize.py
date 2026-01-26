@@ -6,6 +6,7 @@ import os
 import yaml
 import glob
 import matplotlib.pyplot as plt
+import seaborn as sns
 from tqdm import tqdm
 from sklearn.metrics import precision_recall_curve, f1_score
 
@@ -21,7 +22,7 @@ except ImportError as e:
 CONFIG_FILE = "config.yaml"
 MODEL_NAME = "best_model.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_DIR = "diagnosis_results_errors" # 修改输出目录以免混淆
+OUTPUT_DIR = "diagnosis_results_heatmap_fix" # 新目录
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 路径硬编码
@@ -57,52 +58,39 @@ def get_best_threshold(scores, labels):
     return thresholds[best_idx], f1_scores[best_idx]
 
 def select_top_k_events(indices, scores, k=10, min_dist=500, mode='max'):
-    """
-    [新功能] 从候选索引中选择 K 个最具代表性的独立事件
-    避免选出的 10 个点都挤在一起
-    :param mode: 'max' 选分数最高的(误报), 'min' 选分数最低的(漏报)
-    """
-    if len(indices) == 0:
-        return []
-
+    """独立事件筛选"""
+    if len(indices) == 0: return []
     target_scores = scores[indices]
-    
-    # 排序
     if mode == 'max':
-        # 降序：分数越高越严重 (误报之王)
         sorted_idx_positions = np.argsort(target_scores)[::-1]
     else:
-        # 升序：分数越低越严重 (漏报之王：模型觉得特正常)
         sorted_idx_positions = np.argsort(target_scores)
-        
     sorted_indices = indices[sorted_idx_positions]
     
     selected_indices = []
     for idx in sorted_indices:
-        if len(selected_indices) >= k:
-            break
-        
-        # 检查是否与已选的太近 (去重)
+        if len(selected_indices) >= k: break
         is_close = False
         for selected in selected_indices:
             if abs(idx - selected) < min_dist:
                 is_close = True
                 break
-        
-        if not is_close:
-            selected_indices.append(idx)
-            
+        if not is_close: selected_indices.append(idx)
     return selected_indices
 
-def plot_final_diagnosis(mat_orig, mat_recon, mat_pred, 
-                         scores, labels, threshold, 
-                         start_idx, length=500, title="Diagnosis"):
+def plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred, 
+                                scores, labels, threshold, 
+                                start_idx, length=500, title="Diagnosis"):
     """
-    三图流绘制
+    4 图流：Recon, Pred, Decision, Heatmap
     """
     end_idx = min(start_idx + length, len(scores))
     if start_idx >= end_idx: return
-    time_steps = np.arange(start_idx, end_idx)
+    
+    # === 【关键修复】使用相对坐标 (0, 1, 2...) 而不是绝对坐标 ===
+    # 这样才能和 Seaborn Heatmap 的坐标对齐
+    plot_len = end_idx - start_idx
+    time_steps = np.arange(plot_len)
     
     # 切片
     s_orig  = mat_orig[start_idx:end_idx]
@@ -111,8 +99,10 @@ def plot_final_diagnosis(mat_orig, mat_recon, mat_pred,
     s_score = scores[start_idx:end_idx]
     s_label = labels[start_idx:end_idx]
     
-    # 智能特征选择
+    # 计算全量特征误差矩阵 [Time, Features]
     err_matrix = (s_pred - s_orig)**2 + (s_recon - s_orig)**2
+    
+    # 找到最大误差特征
     feat_errors = np.mean(err_matrix, axis=0)
     top_feat_idx = np.argmax(feat_errors)
     
@@ -120,13 +110,14 @@ def plot_final_diagnosis(mat_orig, mat_recon, mat_pred,
     f_recon = s_recon[:, top_feat_idx]
     f_pred = s_pred[:, top_feat_idx]
     
-    # 绘图
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+    # === 绘图 (4 行) ===
+    # sharex=True: 现在大家都是 0-500，可以安全共享了
+    fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
     
     # Row 1: Reconstruction
     axes[0].plot(time_steps, f_orig, color='black', alpha=0.6, label=f'Original (Feat {top_feat_idx})')
     axes[0].plot(time_steps, f_recon, color='green', linestyle='--', linewidth=1.5, label='Reconstruction')
-    axes[0].set_title(f"{title} | Recon Fit (Feat {top_feat_idx})")
+    axes[0].set_title(f"{title} | Recon Fit (Feat {top_feat_idx}) | Start Idx: {start_idx}")
     axes[0].legend(loc='upper right')
     axes[0].grid(True, alpha=0.3)
     
@@ -142,10 +133,20 @@ def plot_final_diagnosis(mat_orig, mat_recon, mat_pred,
     axes[2].axhline(y=threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold ({threshold:.4f})')
     axes[2].fill_between(time_steps, 0, s_score.max(), where=(s_label > 0.5), 
                          color='red', alpha=0.2, label='Ground Truth')
-    
-    axes[2].set_title("Anomaly Score & Decision Threshold")
-    axes[2].legend(loc='upper right')
+    axes[2].set_title("Anomaly Score & Decision")
     axes[2].grid(True, alpha=0.3)
+    
+    # Row 4: Heatmap (全景图)
+    # 转置为 [Features, Time]
+    heatmap_data = err_matrix.T 
+    
+    # 视觉优化
+    vmax = np.percentile(heatmap_data, 99) if len(heatmap_data) > 0 else 1.0
+    
+    sns.heatmap(heatmap_data, ax=axes[3], cmap="Reds", cbar=False, vmin=0, vmax=vmax)
+    axes[3].set_title(f"Global Error Heatmap (All {heatmap_data.shape[0]} Features)")
+    axes[3].set_ylabel("Feature Index")
+    axes[3].set_xlabel(f"Time Steps (+{start_idx})")
     
     plt.tight_layout()
     save_path = f"{OUTPUT_DIR}/{title}_idx{start_idx}.png"
@@ -154,9 +155,9 @@ def plot_final_diagnosis(mat_orig, mat_recon, mat_pred,
     print(f"   📸 Saved: {title}")
 
 def main():
-    print(f"🔥 Error Analysis Visualizer | Device: {DEVICE}")
+    print(f"🔥 Diagnosis with Heatmap Fix | Device: {DEVICE}")
     
-    # 1. 准备数据 & 模型
+    # 1. 加载数据
     try:
         _, test_loader, feature_dim = get_dataloaders(CONFIG_FILE)
     except Exception as e:
@@ -167,6 +168,7 @@ def main():
         config = yaml.safe_load(f)
     config['dataset']['input_dim'] = feature_dim
     
+    # 2. 加载模型
     model = MyFinalModel(config).to(DEVICE)
     if not os.path.exists(MODEL_NAME):
         print(f"❌ 未找到模型: {MODEL_NAME}")
@@ -222,30 +224,24 @@ def main():
     # 🔍 核心逻辑：Top-K 错误分析
     # ==========================================
     
-    # --- A. 分析误报 (False Positives) ---
-    # 定义：Label=0 但 Score > Threshold
+    # A. 分析误报 (FP)
     fp_indices = np.where((labels == 0) & (scores > best_thresh))[0]
     top_fps = select_top_k_events(fp_indices, scores, k=10, mode='max')
     
-    print(f"\n🔎 正在绘制 Top 10 严重误报 (False Positives)...")
-    if len(top_fps) == 0:
-        print("   🎉 完美！没有误报。")
+    print(f"\n🔎 绘制 Top 10 误报 (FP)...")
     for i, idx in enumerate(top_fps):
-        plot_final_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
+        plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred, scores, labels, 
                              threshold=best_thresh,
                              start_idx=max(0, idx - 250), 
                              title=f"FP_Rank{i+1}_Score{scores[idx]:.2f}")
 
-    # --- B. 分析漏报 (False Negatives) ---
-    # 定义：Label=1 但 Score <= Threshold
+    # B. 分析漏报 (FN)
     fn_indices = np.where((labels == 1) & (scores <= best_thresh))[0]
     top_fns = select_top_k_events(fn_indices, scores, k=10, mode='min')
     
-    print(f"\n🔎 正在绘制 Top 10 严重漏报 (False Negatives)...")
-    if len(top_fns) == 0:
-        print("   🎉 完美！没有漏报。")
+    print(f"\n🔎 绘制 Top 10 漏报 (FN)...")
     for i, idx in enumerate(top_fns):
-        plot_final_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
+        plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred, scores, labels, 
                              threshold=best_thresh,
                              start_idx=max(0, idx - 250), 
                              title=f"FN_Rank{i+1}_Score{scores[idx]:.2f}")
