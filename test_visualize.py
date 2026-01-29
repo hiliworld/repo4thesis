@@ -22,11 +22,15 @@ except ImportError as e:
 CONFIG_FILE = "config.yaml"
 MODEL_NAME = "best_model.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_DIR = "diagnosis_results_heatmap_fix" # 新目录
+OUTPUT_DIR = "diagnosis_results_integrated"  # 新的输出目录
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 路径硬编码
 HARDCODED_LABEL_PATH = "/home/sde/MyThesis/data/ServerMachineDataset/test_label"
+
+# ==========================================
+# 🔧 工具函数区
+# ==========================================
 
 def load_labels(config):
     """加载标签"""
@@ -57,13 +61,24 @@ def get_best_threshold(scores, labels):
     best_idx = np.argmax(f1_scores)
     return thresholds[best_idx], f1_scores[best_idx]
 
+def robust_smoothing(scores, window_size=20):
+    """
+    Max Pooling + Moving Average 平滑策略
+    """
+    s = pd.Series(scores)
+    # 1. Max Pooling: 填补漏报坑
+    s_max = s.rolling(window=window_size, center=True, min_periods=1).max()
+    # 2. Mean Smoothing: 边缘平滑
+    s_final = s_max.rolling(window=int(window_size/2), center=True, min_periods=1).mean()
+    return s_final.values
+
 def select_top_k_events(indices, scores, k=10, min_dist=500, mode='max'):
     """独立事件筛选"""
     if len(indices) == 0: return []
     target_scores = scores[indices]
-    if mode == 'max':
+    if mode == 'max': # 找误报 (分数高的)
         sorted_idx_positions = np.argsort(target_scores)[::-1]
-    else:
+    else:             # 找漏报 (分数低的)
         sorted_idx_positions = np.argsort(target_scores)
     sorted_indices = indices[sorted_idx_positions]
     
@@ -78,17 +93,46 @@ def select_top_k_events(indices, scores, k=10, min_dist=500, mode='max'):
         if not is_close: selected_indices.append(idx)
     return selected_indices
 
-def plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred, 
-                                scores, labels, threshold, 
-                                start_idx, length=500, title="Diagnosis"):
+def analyze_root_cause_in_window(err_matrix):
     """
-    4 图流：Recon, Pred, Decision, Heatmap
+    [新功能] 微观诊断：分析这段窗口内的根因
+    :return: 文本摘要 (Top-3 特征)
+    """
+    # 1. 计算每个特征的总误差贡献
+    total_feat_error = np.sum(err_matrix, axis=0)
+    top_3_idx = np.argsort(total_feat_error)[::-1][:3]
+    
+    # 2. 计算稳定性 (Top-1 特征出现的频次)
+    # 在这个时间窗口内，每个时刻谁是 Top-1？
+    top1_per_step = np.argmax(err_matrix, axis=1)
+    # 统计出现最多的特征
+    counts = np.bincount(top1_per_step, minlength=err_matrix.shape[1])
+    dominant_feat = np.argmax(counts)
+    dominance_ratio = counts[dominant_feat] / err_matrix.shape[0]
+    
+    # 生成报告字符串
+    report = f"Top Culprits: Feat {top_3_idx[0]}, {top_3_idx[1]}, {top_3_idx[2]} | "
+    if dominance_ratio > 0.8:
+        report += f"Stable Root Cause: Feat {dominant_feat} ({dominance_ratio*100:.1f}%)"
+    else:
+        report += f"Unstable (Switching): Dominated by Feat {dominant_feat} ({dominance_ratio*100:.1f}%)"
+        
+    return report, top_3_idx[0]
+
+# ==========================================
+# 📊 绘图核心函数
+# ==========================================
+
+def plot_integrated_diagnosis(mat_orig, mat_recon, mat_pred, 
+                              scores, labels, threshold, 
+                              start_idx, length=500, title="Diagnosis"):
+    """
+    集成版绘图：Recon + Pred + Decision + Heatmap + Root Cause Text
     """
     end_idx = min(start_idx + length, len(scores))
     if start_idx >= end_idx: return
     
-    # === 【关键修复】使用相对坐标 (0, 1, 2...) 而不是绝对坐标 ===
-    # 这样才能和 Seaborn Heatmap 的坐标对齐
+    # === 相对坐标 (0, 1, 2...) ===
     plot_len = end_idx - start_idx
     time_steps = np.arange(plot_len)
     
@@ -99,51 +143,56 @@ def plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred,
     s_score = scores[start_idx:end_idx]
     s_label = labels[start_idx:end_idx]
     
-    # 计算全量特征误差矩阵 [Time, Features]
+    # 计算误差矩阵 [Time, Features]
     err_matrix = (s_pred - s_orig)**2 + (s_recon - s_orig)**2
     
-    # 找到最大误差特征
-    feat_errors = np.mean(err_matrix, axis=0)
-    top_feat_idx = np.argmax(feat_errors)
+    # === [新] 调用微观诊断 ===
+    # 计算这段时间内最严重的特征，以及根因报告
+    root_cause_text, top_feat_idx = analyze_root_cause_in_window(err_matrix)
+    print(f"   🕵️‍♂️ {title}: {root_cause_text}")
     
+    # 提取 Top-1 特征的波形用于绘制前两行
     f_orig = s_orig[:, top_feat_idx]
     f_recon = s_recon[:, top_feat_idx]
     f_pred = s_pred[:, top_feat_idx]
     
-    # === 绘图 (4 行) ===
-    # sharex=True: 现在大家都是 0-500，可以安全共享了
-    fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
+    # === 绘图布局 (4行) ===
+    # 关键修改：前3个共享X轴，第4个(Heatmap)不共享，防止干扰
+    fig, axes = plt.subplots(4, 1, figsize=(14, 18))
     
     # Row 1: Reconstruction
     axes[0].plot(time_steps, f_orig, color='black', alpha=0.6, label=f'Original (Feat {top_feat_idx})')
     axes[0].plot(time_steps, f_recon, color='green', linestyle='--', linewidth=1.5, label='Reconstruction')
-    axes[0].set_title(f"{title} | Recon Fit (Feat {top_feat_idx}) | Start Idx: {start_idx}")
+    axes[0].set_title(f"{title} | Recon Fit (Worst Feat {top_feat_idx})")
     axes[0].legend(loc='upper right')
     axes[0].grid(True, alpha=0.3)
-    
+    # 共享 X 轴逻辑手动处理
+    axes[0].set_xlim(0, plot_len)
+
     # Row 2: Prediction
     axes[1].plot(time_steps, f_orig, color='black', alpha=0.6, label=f'Original')
     axes[1].plot(time_steps, f_pred, color='orange', linestyle=':', linewidth=2, label='Prediction')
-    axes[1].set_title(f"{title} | Pred Fit (Feat {top_feat_idx})")
+    axes[1].set_title(f"Prediction Fit (Worst Feat {top_feat_idx})")
     axes[1].legend(loc='upper right')
     axes[1].grid(True, alpha=0.3)
+    axes[1].set_xlim(0, plot_len)
     
-    # Row 3: Decision
+    # Row 3: Decision (Score)
     axes[2].plot(time_steps, s_score, color='blue', linewidth=1.5, label='Anomaly Score')
     axes[2].axhline(y=threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold ({threshold:.4f})')
     axes[2].fill_between(time_steps, 0, s_score.max(), where=(s_label > 0.5), 
                          color='red', alpha=0.2, label='Ground Truth')
-    axes[2].set_title("Anomaly Score & Decision")
+    axes[2].set_title(f"Anomaly Score | {root_cause_text}") # 把诊断结果写在标题里
     axes[2].grid(True, alpha=0.3)
+    axes[2].set_xlim(0, plot_len)
     
-    # Row 4: Heatmap (全景图)
-    # 转置为 [Features, Time]
+    # Row 4: Heatmap
+    # ⚠️ 独立坐标轴，防止 Seaborn 和 Matplotlib 打架
     heatmap_data = err_matrix.T 
-    
-    # 视觉优化
     vmax = np.percentile(heatmap_data, 99) if len(heatmap_data) > 0 else 1.0
     
-    sns.heatmap(heatmap_data, ax=axes[3], cmap="Reds", cbar=False, vmin=0, vmax=vmax)
+    sns.heatmap(heatmap_data, ax=axes[3], cmap="Reds", cbar=False, vmin=0, vmax=vmax, 
+                xticklabels=50) # 每50个点显示一个刻度
     axes[3].set_title(f"Global Error Heatmap (All {heatmap_data.shape[0]} Features)")
     axes[3].set_ylabel("Feature Index")
     axes[3].set_xlabel(f"Time Steps (+{start_idx})")
@@ -152,10 +201,13 @@ def plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred,
     save_path = f"{OUTPUT_DIR}/{title}_idx{start_idx}.png"
     plt.savefig(save_path)
     plt.close()
-    print(f"   📸 Saved: {title}")
+
+# ==========================================
+# 🚀 主程序
+# ==========================================
 
 def main():
-    print(f"🔥 Diagnosis with Heatmap Fix | Device: {DEVICE}")
+    print(f"🔥 Integrated Diagnosis (Smooth + RootCause) | Device: {DEVICE}")
     
     # 1. 加载数据
     try:
@@ -183,7 +235,10 @@ def main():
     with torch.no_grad():
         for x in tqdm(test_loader, desc="Inference"):
             x = x.to(DEVICE)
-            pred_next, recon_window, _ = model(x)
+            # 适配你的模型返回值：可能是 3 个 (Pred, Recon, Latent)
+            ret = model(x)
+            pred_next = ret[0]
+            recon_window = ret[1]
             
             target_curr = x[:, -1, :]
             recon_curr  = recon_window[:, -1, :]
@@ -215,13 +270,20 @@ def main():
     scores = scores[:min_len]
     labels = labels[:min_len]
     
-    # 5. 计算阈值
-    print("⚖️  Calculating Best Threshold...")
+    # ==============================
+    # 🔥 鲁棒平滑 (Max Pooling)
+    # ==============================
+    SMOOTH_WINDOW = 50 
+    print(f"🧹 Applying Max-Pooling Smoothing (Window={SMOOTH_WINDOW})...")
+    scores = robust_smoothing(scores, window_size=SMOOTH_WINDOW)
+    
+    # 5. 计算最佳阈值
+    print("⚖️  Calculating Best Threshold (on smoothed scores)...")
     best_thresh, best_f1 = get_best_threshold(scores, labels)
     print(f"   🏆 Threshold: {best_thresh:.6f} | Best F1: {best_f1:.4f}")
     
     # ==========================================
-    # 🔍 核心逻辑：Top-K 错误分析
+    # 🔍 诊断循环
     # ==========================================
     
     # A. 分析误报 (FP)
@@ -230,10 +292,10 @@ def main():
     
     print(f"\n🔎 绘制 Top 10 误报 (FP)...")
     for i, idx in enumerate(top_fps):
-        plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred, scores, labels, 
+        plot_integrated_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
                              threshold=best_thresh,
                              start_idx=max(0, idx - 250), 
-                             title=f"FP_Rank{i+1}_Score{scores[idx]:.2f}")
+                             title=f"FP_Rank{i+1}")
 
     # B. 分析漏报 (FN)
     fn_indices = np.where((labels == 1) & (scores <= best_thresh))[0]
@@ -241,12 +303,12 @@ def main():
     
     print(f"\n🔎 绘制 Top 10 漏报 (FN)...")
     for i, idx in enumerate(top_fns):
-        plot_diagnosis_with_heatmap(mat_orig, mat_recon, mat_pred, scores, labels, 
+        plot_integrated_diagnosis(mat_orig, mat_recon, mat_pred, scores, labels, 
                              threshold=best_thresh,
                              start_idx=max(0, idx - 250), 
-                             title=f"FN_Rank{i+1}_Score{scores[idx]:.2f}")
+                             title=f"FN_Rank{i+1}")
 
-    print(f"\n✅ 分析完成！请查看 {OUTPUT_DIR}/ 文件夹。")
+    print(f"\n✅ 图片已保存至 {OUTPUT_DIR}/")
 
 if __name__ == "__main__":
     main()

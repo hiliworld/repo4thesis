@@ -151,6 +151,7 @@ def evaluate(args):
     min_len = min(len(scores), len(labels))
     scores = scores[:min_len]
     labels = labels[:min_len]
+   
     
     # 5. 计算指标
     print("📊 Calculating Metrics...")

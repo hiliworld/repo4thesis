@@ -34,10 +34,10 @@ dataset:
 
 model:
   hidden_dim: 64
-  z_dim: 16
+  z_dim: 32
 
 train:
-  batch_size: 64
-  epochs: 50
-  lr: 0.001
-  patience: 5
+  batch_size: 256
+  epochs: 70
+  lr: 0.0005
+  patience: 10
