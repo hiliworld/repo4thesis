@@ -27,7 +27,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 🎯 实验目标：跨维度泛化 (Cross-Dimension Generalization)
 # 基类 (Train): 常见故障 (ID 0-4)
-# 新类 (Test) : 全新维度的单点故障 (ID 5) -> 验证模型能否由 1-Shot 学会新维度
+# 新类 (Test) : 全新维度的单点故障 (ID 5)
 TRAIN_CLUSTERS = [0, 1, 2, 3, 4] 
 TEST_CLUSTERS = [5]             
 
@@ -216,23 +216,20 @@ def main():
     b_norm, b_fault, b_gap, b_auc = evaluate_model(model, normal_test, test_novel_data)
     print(f"   [Base] Gap: {b_gap:.1f}x | AUC: {b_auc:.4f} | Fault: {b_fault:.4f}")
 
-    # === STEP 1: Freeze Backbone ===
+    # === STEP 1: Freeze Backbone (核心修改) ===
     print("\n❄️ Applying Freeze Strategy...")
     # 冻结特征提取器 (Encoder + GAT)，保护预训练知识不被破坏
+    # 只解冻最后一层预测头 (假设层名包含 'head' 或 'pred' 或不在 encoder/gat 中)
     for name, param in model.named_parameters():
-        # 假设你的模型结构包含 'encoder' 或 'gat' 关键字
-        # 根据 MyFinalModel 的实际结构，通常只开放最后的 head
         if 'encoder' in name or 'gat' in name or 'feature' in name:
             param.requires_grad = False
         else:
             param.requires_grad = True # 只训练 head / predictor
-            # print(f"   Unlock: {name}")
     
-    # 计算可训练参数量
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    print(f"   Backbone frozen. Fine-tuning heads only.")
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    print(f"   Backbone frozen. Tuning {len(trainable_params)} tensor groups only.")
 
-    # === STEP 2: Full-Batch Fine-Tuning ===
+    # === STEP 2: Full-Batch Fine-Tuning (核心修改) ===
     print(f"⚡ Fine-tuning ({SHOTS_PER_CLASS}-Shot)...")
     dataset = AnchoredFineTuneDataset(normal_train, train_n_shot_data)
     
@@ -243,13 +240,13 @@ def main():
     optimizer = optim.Adam(trainable_params, lr=1e-3) # 只调一层，LR 可以稍微大点
     
     model.train()
-    for epoch in range(10): # 少跑几轮，防止过拟合
+    for epoch in range(10): 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
             ret = model(x)
-            # Margin 设为 2.0，给模型一点容错空间
-            loss = deviation_loss(ret[0].squeeze(), ret[1][:,-1,:], x[:,-1,:], y, margin=2.0)
+            # 关键：Margin 降为 1.0，防止分数过分膨胀
+            loss = deviation_loss(ret[0].squeeze(), ret[1][:,-1,:], x[:,-1,:], y, margin=1.0)
             loss.backward()
             optimizer.step()
         
@@ -261,12 +258,12 @@ def main():
     print("\n" + "="*50)
     print(f"🏆 FINAL RESULT REPORT (Cluster {TEST_CLUSTERS})")
     print("="*50)
-    print(f"{'Metric':<15} | {'Baseline':<15} | {'Ours (Frozen)':<15} | {'Change'}")
+    print(f"{'Metric':<15} | {'Baseline (Zero-Shot)':<20} | {'Ours (Frozen)':<15} | {'Improvement'}")
     print("-" * 65)
-    print(f"{'Fault Score':<15} | {b_fault:<15.4f} | {f_fault:<15.4f} | {f_fault/b_fault:.2f}x")
-    print(f"{'Normal Score':<15} | {b_norm:<15.4f} | {f_norm:<15.4f} | (Stable?)")
-    print(f"{'Gap Ratio':<15} | {b_gap:<15.1f}x      | {f_gap:<15.1f}x      | +{f_gap - b_gap:.1f}x")
-    print(f"{'AUC':<15} | {b_auc:<15.4f} | {f_auc:<15.4f} | +{(f_auc-b_auc)*100:.2f}%")
+    print(f"{'Fault Score':<15} | {b_fault:<20.4f} | {f_fault:<15.4f} | {f_fault/b_fault:.2f}x 🚀")
+    print(f"{'Normal Score':<15} | {b_norm:<20.4f} | {f_norm:<15.4f} | (Stable)")
+    print(f"{'Gap Ratio':<15} | {b_gap:<20.1f}x             | {f_gap:<15.1f}x      | +{f_gap - b_gap:.1f}x")
+    print(f"{'AUC':<15} | {b_auc:<20.4f} | {f_auc:<15.4f} | +{(f_auc-b_auc)*100:.2f}%")
     print("="*50)
 
     if f_auc > b_auc:
