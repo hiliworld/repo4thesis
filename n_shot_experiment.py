@@ -161,6 +161,16 @@ def main():
         normal_data_pool.append(x.numpy())
     normal_data = np.concatenate(normal_data_pool)
     
+    # === 🛡️ [修正] 防止数据泄漏：划分正常数据集 ===
+    # 将正常数据一分为二：
+    # normal_train: 用于微调时的负样本 (Support Set)
+    # normal_test : 用于最终评估计算 Normal Score (Query Set)
+    split_idx = int(len(normal_data) * 0.5)
+    normal_train = normal_data[:split_idx]
+    normal_test = normal_data[split_idx:]
+    
+    print(f"   🛡️ Data Leakage Protection: Split Normal Data -> Train: {len(normal_train)} | Test: {len(normal_test)}")
+    
     # B. 训练数据：N-Shot
     train_n_shot_data = get_n_shot_data(test_loader, df_clusters, TRAIN_CLUSTERS, shots=SHOTS_PER_CLASS)
     
@@ -179,7 +189,8 @@ def main():
     
     # 3. 极速微调
     print(f"\n⚡ Fine-tuning with {len(train_n_shot_data)} samples...")
-    dataset = FaultFineTuneDataset(normal_data, train_n_shot_data)
+    # [修正] 使用 normal_train 进行训练
+    dataset = FaultFineTuneDataset(normal_train, train_n_shot_data)
     train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
     optimizer = optim.Adam(model.parameters(), lr=1e-5)
     
@@ -213,7 +224,11 @@ def main():
     
     # 计算 Normal 分数
     scores_norm = []
-    t_norm = torch.from_numpy(normal_data[:len(test_novel_data)]).float().to(DEVICE) # 1:1 对比
+    # [修正] 使用 normal_test 进行评估 (模型在微调时从未见过这些样本)
+    # 保持与测试故障样本数量一致，进行 1:1 对比
+    eval_len = min(len(normal_test), len(test_novel_data))
+    t_norm = torch.from_numpy(normal_test[:eval_len]).float().to(DEVICE) 
+    
     with torch.no_grad():
         ret = model(t_norm)
         l = torch.mean((ret[0].squeeze()-t_norm[:,-1,:])**2, 1) + torch.mean((ret[1][:,-1,:]-t_norm[:,-1,:])**2, 1)
