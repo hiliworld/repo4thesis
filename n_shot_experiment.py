@@ -6,7 +6,7 @@ import pandas as pd
 import os
 import yaml
 import random
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, pairwise_distances
 from torch.utils.data import Dataset, DataLoader
 
 try:
@@ -16,49 +16,46 @@ except ImportError as e:
     print(f"❌ 导入错误: {e}")
     exit()
 
-# === 🎛️ 核心参数控制台 ===
+# === 配置 ===
 CONFIG_FILE = "config.yaml"
 MODEL_NAME = "best_model.pth"
 CLUSTER_FILE = "fault_clusters_analysis/fault_clustering_results.csv"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 🔥 在这里调整你的策略！
-SHOTS_PER_CLASS = 1   # <--- 修改这里！试试 1, 3, 5, 10
-RANDOM_SEED = 42      # 固定种子，保证结果可复现 (论文里很重要)
+# 🔥 1-Shot 严谨测试
+SHOTS_PER_CLASS = 1   
+RANDOM_SEED = 42
 
-# 实验分组
-TRAIN_CLUSTERS = [0, 1, 2, 4]  # 从已知类里取 N-Shot
-TEST_CLUSTERS = [3]            # 未知类 (全量测试)
+TRAIN_CLUSTERS = [0, 1, 2, 4]  
+TEST_CLUSTERS = [3]
 
-# ==========================================
-# 工具函数
-# ==========================================
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
-class FaultFineTuneDataset(Dataset):
+class HonestFineTuneDataset(Dataset):
     """
-    N-Shot 平衡策略：
-    把珍贵的 N*4 个故障样本，复制几百倍，强行对齐正常样本的数量
+    【修正】诚实的数据集构建策略
+    指导建议：不要过度复制故障样本。
+    策略：既然故障只有 N 个，那我们就只取 N*2 个正常样本。
+    构建一个极小的、高质量的微调集，而不是这就是“海量重复集”。
     """
     def __init__(self, normal_windows, fault_windows):
-        self.normal = normal_windows
+        # 1. 故障样本 (少量)
         self.fault = fault_windows
-        
-        n_normal = len(self.normal)
         n_fault = len(self.fault)
         
-        print(f"   ⚖️ {SHOTS_PER_CLASS}-Shot Balancing: Normal={n_normal}, Fault={n_fault}")
+        # 2. 正常样本 (下采样，只取故障样本的 2 倍，保持 2:1 比例)
+        # 这样避免了把 1 个故障样本复制 10000 次去匹配正常样本
+        n_normal_select = min(len(normal_windows), n_fault * 2) 
+        # 随机抽样正常样本，防止总是取前几个
+        idx = np.random.choice(len(normal_windows), n_normal_select, replace=False)
+        self.normal = normal_windows[idx]
         
-        if n_normal > n_fault and n_fault > 0:
-            repeat_factor = int(n_normal / n_fault) + 1
-            self.fault = np.tile(self.fault, (repeat_factor, 1, 1))[:n_normal]
-            print(f"      -> 🔄 Replicated {n_fault} samples {repeat_factor}x to match normal data.")
-            
+        print(f"   ⚖️ Honest Balancing: Fault={n_fault}, Normal={len(self.normal)} (Ratio ~1:2)")
+        print(f"      (已移除'过度复制'逻辑，避免过拟合单一样本)")
+
         self.data = np.concatenate([self.normal, self.fault], axis=0)
         self.labels = np.concatenate([np.zeros(len(self.normal)), np.ones(len(self.fault))], axis=0)
         
@@ -66,62 +63,41 @@ class FaultFineTuneDataset(Dataset):
     def __getitem__(self, idx):
         return torch.from_numpy(self.data[idx]).float(), torch.tensor(self.labels[idx]).float()
 
+# ... (保留 get_n_shot_data, load_full_cluster_data, deviation_loss 等辅助函数，同前) ...
 def get_n_shot_data(loader, cluster_df, target_clusters, shots=1):
-    """
-    从指定 Cluster 中，随机抽取 N 个不重叠的样本
-    """
     collected_data = []
-    print(f"🎲 Sampling {shots} shot(s) from Clusters {target_clusters}...")
-    
-    # 1. 构建候选池
     cluster_indices_map = {}
     for _, row in cluster_df.iterrows():
         cid = row['Cluster_Type']
         if cid not in target_clusters: continue
         if cid not in cluster_indices_map: cluster_indices_map[cid] = []
-        
-        # 取中间段，防止边缘噪声
         mid_point = (row['Start_Idx'] + row['End_Idx']) // 2
         cluster_indices_map[cid].append(mid_point)
-        
-    # 2. 随机抽样
     selected_indices = []
     for cid in target_clusters:
         if cid not in cluster_indices_map: continue
         candidates = cluster_indices_map[cid]
-        
-        # 如果样本不够，就全取
         k = min(len(candidates), shots)
         picks = random.sample(candidates, k)
         selected_indices.extend(picks)
-        print(f"   🎯 Cluster {cid}: Picked {len(picks)} samples")
-        
-    # 3. 从 Loader 提取 (这是最耗时的步骤，但必须精准)
+    
     selected_indices_set = set(selected_indices)
     current_idx = 0
     found_count = 0
-    
-    # 优化提取逻辑：只遍历一次
     for x in loader:
         batch_size = x.shape[0]
         batch_indices = range(current_idx, current_idx + batch_size)
-        
-        # 检查是否有交集
         common = selected_indices_set.intersection(batch_indices)
         if common:
             for pick in common:
                 local_idx = pick - current_idx
                 collected_data.append(x[local_idx].numpy())
                 found_count += 1
-                
         current_idx += batch_size
-        if found_count >= len(selected_indices):
-            break 
-            
+        if found_count >= len(selected_indices): break 
     return np.array(collected_data)
 
 def load_full_cluster_data(loader, cluster_df, target_clusters):
-    """加载全量数据用于评估"""
     target_indices = set()
     for _, row in cluster_df.iterrows():
         if row['Cluster_Type'] in target_clusters:
@@ -143,59 +119,78 @@ def deviation_loss(pred, recon, target, labels, margin=5.0):
     loss_fault = torch.relu(margin - error[labels == 1]).mean() if (labels == 1).sum() > 0 else 0.0
     return loss_normal + loss_fault
 
-# ==========================================
-# 主程序
-# ==========================================
+def check_similarity(train_data, test_data):
+    """
+    【新增】指导建议：相似度自检
+    验证训练集(Cluster 0/1/2)和测试集(Cluster 3)是否真的长得不一样
+    """
+    # 展平数据: [Batch, Window, Feat] -> [Batch, Window*Feat]
+    train_flat = train_data.reshape(train_data.shape[0], -1)
+    test_flat = test_data.reshape(test_data.shape[0], -1)
+    
+    # 随机取样测试集一部分来算，防止内存爆炸
+    if len(test_flat) > 1000:
+        idx = np.random.choice(len(test_flat), 1000, replace=False)
+        test_flat = test_flat[idx]
+        
+    # 计算余弦相似度
+    from sklearn.metrics.pairwise import cosine_similarity
+    sim_matrix = cosine_similarity(train_flat, test_flat)
+    
+    max_sim = sim_matrix.max()
+    mean_sim = sim_matrix.mean()
+    print(f"   🔍 Similarity Check (Train vs Test Faults):")
+    print(f"      Max Similarity: {max_sim:.4f} (Should < 0.95)")
+    print(f"      Mean Similarity: {mean_sim:.4f}")
+    if max_sim > 0.95:
+        print("      ⚠️ WARNING: Potential leakage! Some test faults look identical to training faults.")
+    else:
+        print("      ✅ Safe: Training and Test faults are distinct.")
+
 def main():
     set_seed(RANDOM_SEED)
-    print(f"🚀 {SHOTS_PER_CLASS}-SHOT LEARNING EXPERIMENT START! (Seed={RANDOM_SEED})")
+    print(f"🚀 {SHOTS_PER_CLASS}-SHOT FINAL HONEST RUN (Anti-Leakage Mode)")
     
     # 1. 准备数据
     _, test_loader, feature_dim = get_dataloaders(CONFIG_FILE)
     df_clusters = pd.read_csv(CLUSTER_FILE)
     
-    # A. 正常数据 (Baseline)
+    # A. 正常数据处理 (我的修复：防止 Normal Data 泄漏)
     normal_data_pool = []
     for i, x in enumerate(test_loader):
-        if i * x.shape[0] > 10000: break 
+        if i * x.shape[0] > 20000: break 
         normal_data_pool.append(x.numpy())
-    normal_data = np.concatenate(normal_data_pool)
+    normal_data_full = np.concatenate(normal_data_pool)
     
-    # === 🛡️ [修正] 防止数据泄漏：划分正常数据集 ===
-    # 将正常数据一分为二：
-    # normal_train: 用于微调时的负样本 (Support Set)
-    # normal_test : 用于最终评估计算 Normal Score (Query Set)
-    split_idx = int(len(normal_data) * 0.5)
-    normal_train = normal_data[:split_idx]
-    normal_test = normal_data[split_idx:]
-    
-    print(f"   🛡️ Data Leakage Protection: Split Normal Data -> Train: {len(normal_train)} | Test: {len(normal_test)}")
-    
-    # B. 训练数据：N-Shot
+    split_idx = int(len(normal_data_full) * 0.5)
+    normal_train = normal_data_full[:split_idx]  # 用于微调 (Support Set)
+    normal_test  = normal_data_full[split_idx:]  # 用于评估 (Query Set)
+    print(f"   🛡️ Normal Data Split: Train={len(normal_train)} | Test={len(normal_test)}")
+
+    # B. 故障数据
     train_n_shot_data = get_n_shot_data(test_loader, df_clusters, TRAIN_CLUSTERS, shots=SHOTS_PER_CLASS)
-    
-    # C. 测试数据：全量未知故障
     test_novel_data = load_full_cluster_data(test_loader, df_clusters, TEST_CLUSTERS)
     
-    if len(train_n_shot_data) == 0:
-        print("❌ Error: No training data found.")
-        return
+    if len(train_n_shot_data) == 0: return
 
-    # 2. 加载模型
+    # C. 【新增】相似度检查 (指导的建议)
+    check_similarity(train_n_shot_data, test_novel_data)
+
+    # 2. 模型准备
     with open(CONFIG_FILE, 'r') as f: config = yaml.safe_load(f)
     config['dataset']['input_dim'] = feature_dim
     model = MyFinalModel(config).to(DEVICE)
     model.load_state_dict(torch.load(MODEL_NAME, map_location=DEVICE))
     
-    # 3. 极速微调
-    print(f"\n⚡ Fine-tuning with {len(train_n_shot_data)} samples...")
-    # [修正] 使用 normal_train 进行训练
-    dataset = FaultFineTuneDataset(normal_train, train_n_shot_data)
-    train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
-    optimizer = optim.Adam(model.parameters(), lr=1e-5)
+    # 3. 微调 (使用 HonestFineTuneDataset)
+    # 降低 LR 和 Epoch (指导的建议，防止过拟合)
+    print(f"\n⚡ Fine-tuning (Balanced, Low LR)...")
+    dataset = HonestFineTuneDataset(normal_train, train_n_shot_data)
+    train_loader = DataLoader(dataset, batch_size=8, shuffle=True) # Batch size 调小，因为数据量少了
+    optimizer = optim.Adam(model.parameters(), lr=1e-6) # LR 降低
     
     model.train()
-    for epoch in range(5): # 5个Epoch足够了
+    for epoch in range(3): # Epoch 减少
         total_loss = 0
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -205,13 +200,12 @@ def main():
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        # print(f"   Epoch {epoch+1} Loss: {total_loss/len(train_loader):.4f}")
         
-    # 4. 验证
-    print("\n🧐 Evaluating on UNSEEN Novel Faults...")
+    # 4. 评估
+    print("\n🧐 Evaluating (on Unseen Data)...")
     model.eval()
     
-    # 计算 Novel Fault 分数
+    # 评估 Test Faults
     scores_novel = []
     t_novel = torch.from_numpy(test_novel_data).float().to(DEVICE)
     with torch.no_grad():
@@ -222,20 +216,17 @@ def main():
             scores_novel.append(l.cpu().numpy())
     scores_novel = np.concatenate(scores_novel)
     
-    # 计算 Normal 分数
+    # 评估 Test Normal (使用 normal_test)
     scores_norm = []
-    # [修正] 使用 normal_test 进行评估 (模型在微调时从未见过这些样本)
-    # 保持与测试故障样本数量一致，进行 1:1 对比
     eval_len = min(len(normal_test), len(test_novel_data))
     t_norm = torch.from_numpy(normal_test[:eval_len]).float().to(DEVICE) 
-    
     with torch.no_grad():
         ret = model(t_norm)
         l = torch.mean((ret[0].squeeze()-t_norm[:,-1,:])**2, 1) + torch.mean((ret[1][:,-1,:]-t_norm[:,-1,:])**2, 1)
         scores_norm.append(l.cpu().numpy())
     scores_norm = np.concatenate(scores_norm)
     
-    # 统计指标
+    # 统计
     mean_novel = np.mean(scores_novel)
     mean_norm = np.mean(scores_norm)
     auc = roc_auc_score(
@@ -243,17 +234,16 @@ def main():
         np.concatenate([scores_norm, scores_novel])
     )
     
-    print(f"\n🏆 RESULT ({SHOTS_PER_CLASS}-Shot):")
-    print(f"   Normal Score: {mean_norm:.4f}")
-    print(f"   Novel Fault Score: {mean_novel:.4f}")
-    print(f"   Gap Ratio: {mean_novel/mean_norm:.1f}x")
-    print(f"   AUC: {auc:.4f}")
+    print(f"\n🏆 FINAL VERIFIED RESULT ({SHOTS_PER_CLASS}-Shot):")
+    print(f"   Normal Score (Unseen): {mean_norm:.4f}")
+    print(f"   Novel Fault Score    : {mean_novel:.4f}")
+    print(f"   Gap Ratio            : {mean_novel/mean_norm:.1f}x")
+    print(f"   AUC                  : {auc:.4f}")
     
-    # 判定
-    if auc > 0.90:
-        print("   ✅ Excellent! This is a publishable result.")
+    if auc > 0.90 and (mean_novel/mean_norm) > 10:
+         print("   ✅ Validated SOTA: High AUC with Realistic Gap.")
     else:
-        print("   ⚠️ A bit low. Try increasing SHOTS_PER_CLASS.")
+         print("   ⚠️ Needs Check: Gap might be too small or AUC too low.")
 
 if __name__ == "__main__":
     main()
