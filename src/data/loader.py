@@ -68,6 +68,7 @@ class SmartTimeSeriesDataset(Dataset):
         # === 5. 独立切窗 (Safe Windowing) ===
         self.window_size = config['dataset']['window_size']
         self.windows = []
+        self.full_sequences = []
         
         # 逐个文件处理，绝不跨文件切窗！
         for df in cleaned_list:
@@ -77,6 +78,7 @@ class SmartTimeSeriesDataset(Dataset):
             
             # 2. 归一化 (关键：运算后必须强转回 float32，否则会变成 float64)
             data = ((data - self.min_val) / self.scale_denom).astype(np.float32)
+            self.full_sequences.append(data)
             
             # 3. 切片
             if len(data) >= self.window_size:
@@ -148,7 +150,20 @@ class SmartTimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return torch.from_numpy(self.windows[idx])
 
-def get_dataloaders(config_path='config.yaml'):
+    def get_full_sequences(self):
+        """返回归一化后的完整序列列表，供在线滚动推理使用。"""
+        return self.full_sequences
+
+    def normalize_external_sequence(self, seq):
+        """对外部序列复用训练归一化统计量。"""
+        seq = np.asarray(seq, dtype=np.float32)
+        return ((seq - self.min_val) / self.scale_denom).astype(np.float32)
+
+    def denormalize_sequence(self, seq):
+        seq = np.asarray(seq, dtype=np.float32)
+        return (seq * self.scale_denom + self.min_val).astype(np.float32)
+
+def get_dataloaders(config_path='config.yaml', return_datasets=False):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
@@ -188,4 +203,6 @@ def get_dataloaders(config_path='config.yaml'):
     )
     test_loader = DataLoader(test_dataset, batch_size=config['train']['batch_size'], shuffle=False)
     
+    if return_datasets:
+        return train_loader, test_loader, train_dataset.feature_dim, train_dataset, test_dataset
     return train_loader, test_loader, train_dataset.feature_dim

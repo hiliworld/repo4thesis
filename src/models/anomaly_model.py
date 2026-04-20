@@ -12,6 +12,7 @@ class MyFinalModel(nn.Module):
         self.num_nodes = config['dataset']['input_dim'] # 节点数 (e.g., 38)
         self.window_size = config['dataset']['window_size']
         self.hidden_dim = config['model'].get('hidden_dim', 64)
+        encoder_cfg = config.get('model', {}).get('encoder', {})
         
         # === 2. 核心组件初始化 ===
         
@@ -19,7 +20,10 @@ class MyFinalModel(nn.Module):
         # 根据你提供的代码，input_dim 应固定为 1 (单通道处理)，z_dim 对应 hidden_dim
         self.metric_encoder = LNT_Conv_Encoder(
             input_dim=1,           # 必须是 1，因为 forward 里强制 view(..., 1, seq_len)
-            z_dim=self.hidden_dim  # 对应 LNT 代码里的 z_dim
+            z_dim=self.hidden_dim, # 对应 LNT 代码里的 z_dim
+            kernel_sizes=encoder_cfg.get('kernel_sizes', [3, 5, 9, 17]),
+            head_channels=encoder_cfg.get('head_channels', 8),
+            dropout=encoder_cfg.get('dropout', 0.1),
         )
         
         # [组件 B] GAT Layer

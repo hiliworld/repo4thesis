@@ -35,9 +35,22 @@ dataset:
 model:
   hidden_dim: 64
   z_dim: 32
+  encoder:
+    kernel_sizes: [3, 5, 9, 17]
+    head_channels: 8
+    dropout: 0.1
 
 train:
   batch_size: 256
   epochs: 70
   lr: 0.0005
   patience: 10
+
+inference:
+  alpha_pred: 1.0
+  beta_recon: 1.0
+  ema_alpha: 0.2
+  high_percentile: 99.0
+  low_percentile: 95.0
+  use_isolation: true
+  replacement_mix: 0.5
