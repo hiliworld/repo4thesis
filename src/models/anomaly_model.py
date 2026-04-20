@@ -100,18 +100,26 @@ class MyFinalModel(nn.Module):
             proto_outputs = self.prototype_fusion(x, z_fused)
 
         z_corrected = proto_outputs['z_corrected']
-        pred_next = self.pred_head(z_corrected).squeeze(-1)
-        recon_window = self.recon_head(z_corrected).permute(0, 2, 1)
+        pred_raw = self.pred_head(z_fused).squeeze(-1)
+        recon_raw = self.recon_head(z_fused).permute(0, 2, 1)
+        pred_corrected = self.pred_head(z_corrected).squeeze(-1)
+        recon_corrected = self.recon_head(z_corrected).permute(0, 2, 1)
 
         return ModelOutput({
-            'pred': pred_next,
-            'recon': recon_window,
+            # 为了兼容现有训练/测试脚本，默认 pred/recon 走 corrected 分支
+            'pred': pred_corrected,
+            'recon': recon_corrected,
+            # 新增双路输出：raw vs corrected
+            'pred_raw': pred_raw,
+            'recon_raw': recon_raw,
+            'pred_corrected': pred_corrected,
+            'recon_corrected': recon_corrected,
             'z_fused': z_fused,
             'z_corrected': z_corrected,
             'node_assign': proto_outputs['node_assign'],
             'patch_assign': proto_outputs['patch_assign'],
             'node_proto_latent': proto_outputs['node_proto'],
-            'patch_proto_latent': proto_outputs['patch_global_delta'],
+            'patch_proto_latent': proto_outputs['patch_proto'],
             'node_delta': proto_outputs['node_delta'],
             'patch_delta': proto_outputs['patch_delta'],
             'patch_global_delta': proto_outputs['patch_global_delta'],

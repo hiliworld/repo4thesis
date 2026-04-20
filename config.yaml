@@ -49,6 +49,9 @@ model:
     tau_patch: 0.1
     lambda_node: 0.5
     lambda_patch: 0.3
+    lambda_node_proto_loss: 0.02
+    lambda_patch_proto_loss: 0.02
+    lambda_corr_loss: 0.005
     patch_size: 10
     fusion_mode: "residual_add"
 
@@ -66,3 +69,6 @@ inference:
   low_percentile: 95.0
   use_isolation: true
   replacement_mix: 0.5
+  save_anomaly_segments: true
+  anomaly_segment_csv: "outputs/anomaly_segments.csv"
+  anomaly_segment_pkl: "outputs/anomaly_segments.pkl"

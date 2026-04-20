@@ -17,7 +17,7 @@ class SmartTimeSeriesDataset(Dataset):
         
         # === 1. 扫描文件 (File Scanning) ===
         self.file_paths = self._scan_files(data_path)
-        print(f"📂 [{mode.upper()}] 扫描到 {len(self.file_paths)} 个数据文件: {data_path}")
+        print(f"[{mode.upper()}] 扫描到 {len(self.file_paths)} 个数据文件: {data_path}")
 
         # === 2. 加载所有数据 (Load All) ===
         # 为了保证清洗和归一化的一致性，我们需要先把所有数据加载进来（内存允许的情况下）
@@ -29,7 +29,7 @@ class SmartTimeSeriesDataset(Dataset):
             
         # 拼接成一个巨大的临时表来计算统计量 (只用于计算，不用于切窗)
         full_df = pd.concat(self.df_list, axis=0, ignore_index=True)
-        print(f"   📊 原始数据总量: {full_df.shape}")
+        print(f"   原始数据总量: {full_df.shape}")
 
         # === 3. 全局自动清洗 (Global Auto-Cleaning) ===
         # 核心逻辑：训练集决定哪些列要留，测试集必须遵守！
@@ -52,7 +52,7 @@ class SmartTimeSeriesDataset(Dataset):
         full_cleaned = pd.concat(cleaned_list, axis=0, ignore_index=True)
         self.feature_dim = full_cleaned.shape[1]
         
-        print(f"   🧹 清洗后特征维度: {self.feature_dim} (丢弃了 {full_df.shape[1] - self.feature_dim} 列)")
+        print(f"   清洗后特征维度: {self.feature_dim} (丢弃了 {full_df.shape[1] - self.feature_dim} 列)")
 
         # === 4. 全局归一化 (Global Normalization) ===
         if config['dataset']['normalization'] == 'minmax':
@@ -87,7 +87,7 @@ class SmartTimeSeriesDataset(Dataset):
         
         # 转 numpy (加速 DataLoader)
         self.windows = np.array(self.windows)
-        print(f"✅ [{mode.upper()}] 准备就绪. 生成窗口数: {len(self.windows)}")
+        print(f"[{mode.upper()}] 准备就绪. 生成窗口数: {len(self.windows)}")
 
     def _scan_files(self, path):
         if os.path.isfile(path):
@@ -164,7 +164,8 @@ class SmartTimeSeriesDataset(Dataset):
         return (seq * self.scale_denom + self.min_val).astype(np.float32)
 
 def get_dataloaders(config_path='config.yaml', return_datasets=False):
-    with open(config_path, 'r') as f:
+    # 统一使用 UTF-8（兼容 BOM），避免在 Windows 默认编码下读取失败
+    with open(config_path, 'r', encoding='utf-8-sig') as f:
         config = yaml.safe_load(f)
     
     # 1. 加载训练集 (计算全局统计量)

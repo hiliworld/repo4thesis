@@ -28,8 +28,17 @@ def get_best_f1(labels, scores):
     # 2. 搜索最佳阈值
     precision, recall, thresholds = precision_recall_curve(labels, scores)
     f1_scores = 2 * recall * precision / (recall + precision + 1e-10)
-    best_f1 = np.max(f1_scores)
-    best_thresh = thresholds[np.argmax(f1_scores)]
+
+    # precision_recall_curve 返回的 precision/recall 会比 thresholds 多一个点，
+    # 末尾点没有对应阈值，直接用其索引访问 thresholds 会触发越界。
+    if thresholds.size == 0:
+        best_f1 = float(np.max(f1_scores))
+        best_thresh = float(np.max(scores))
+    else:
+        aligned_f1_scores = f1_scores[:-1]
+        best_idx = int(np.argmax(aligned_f1_scores))
+        best_f1 = float(aligned_f1_scores[best_idx])
+        best_thresh = float(thresholds[best_idx])
     
     # 3. 计算 PA-F1
     pred_pa = point_adjustment(scores, labels, best_thresh)
