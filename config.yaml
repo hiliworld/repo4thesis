@@ -35,6 +35,17 @@ dataset:
 model:
   hidden_dim: 64
   z_dim: 32
+  use_prototype_fusion: true
+  prototype:
+    use_node_prototype: true
+    use_patch_prototype: true
+    num_node_prototypes: 8
+    num_patch_prototypes: 8
+    tau_node: 0.1
+    tau_patch: 0.1
+    lambda_node: 0.5
+    lambda_patch: 0.3
+    patch_size: 10
 
 train:
   batch_size: 256

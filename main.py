@@ -62,7 +62,9 @@ def train(args):
             optimizer.zero_grad()
             
             # Forward
-            pred, recon, _ = model(x)
+            outputs = model(x)
+            pred = outputs["pred"]
+            recon = outputs["recon"]
             
             # Loss Calculation
             # 任务A: 预测 (Target: x[:,-1,:])
@@ -129,7 +131,9 @@ def evaluate(args):
     with torch.no_grad():
         for x in tqdm(test_loader):
             x = x.to(DEVICE)
-            pred, recon, _ = model(x)
+            outputs = model(x)
+            pred = outputs["pred"]
+            recon = outputs["recon"]
             
             # Score = Prediction Error + Reconstruction Error
             l_pred = torch.mean((pred - x[:, -1, :]) ** 2, dim=1)
