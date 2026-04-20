@@ -130,8 +130,8 @@ def online_rollout_sequence(model, sequence, config):
 
 def train(args):
     config = load_config(args.config)
-    print(f"🔥 Mode: TRAIN | Device: {DEVICE}")
-    print(f"📜 Config: {args.config}")
+    print(f"Mode: TRAIN | Device: {DEVICE}")
+    print(f"Config: {args.config}")
 
     train_loader, _, input_dim = get_dataloaders(args.config)
     config['dataset']['input_dim'] = input_dim
@@ -148,7 +148,7 @@ def train(args):
     patience_counter = 0
     save_path = "best_model.pth"
 
-    print("\n🚀 Start Training...")
+    print("\nStart Training...")
     model.train()
 
     for epoch in range(epochs):
@@ -189,19 +189,19 @@ def train(args):
             best_loss = avg_loss
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"   💾 Saved Best Model ({avg_loss:.4f})")
+            print(f"   Saved Best Model ({avg_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print("🛑 Early Stopping Triggered.")
+                print("Early Stopping Triggered.")
                 break
 
-    print(f"✅ Training Complete. Model saved to {save_path}")
+    print(f"Training Complete. Model saved to {save_path}")
 
 
 def evaluate(args):
     config = load_config(args.config)
-    print(f"🔥 Mode: TEST | Device: {DEVICE}")
+    print(f"Mode: TEST | Device: {DEVICE}")
 
     _, test_loader, input_dim, train_dataset, test_dataset = get_dataloaders(args.config, return_datasets=True)
     config['dataset']['input_dim'] = input_dim
@@ -209,7 +209,7 @@ def evaluate(args):
     model = MyFinalModel(config).to(DEVICE)
     model_path = "best_model.pth"
     if not os.path.exists(model_path):
-        print(f"❌ Error: Model file {model_path} not found. Run train first.")
+        print(f"Error: Model file {model_path} not found. Run train first.")
         return
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
@@ -224,7 +224,7 @@ def evaluate(args):
     
     # 3. 推理 (Inference)
     scores = []
-    print("🚀 Running Inference...")
+    print("Running Inference...")
     with torch.no_grad():
         for x in tqdm(test_loader):
             x = x.to(DEVICE)
@@ -244,14 +244,14 @@ def evaluate(args):
     # 这一步稍微复杂，需要去 dataset 目录找 label
     labels = load_labels(config)
     if labels is None:
-        print("⚠️ No labels found. Skipping evaluation metrics.")
+        print("No labels found. Skipping evaluation metrics.")
         return
 
     min_len = min(len(scores), len(labels))
     scores = scores[:min_len]
     labels = labels[:min_len]
 
-    print("📊 Calculating Metrics...")
+    print("Calculating Metrics...")
     metrics = get_best_f1(labels, scores)
     state_preds = apply_dual_threshold_state_machine(scores, high_threshold, low_threshold)
     dual_f1 = (2 * ((state_preds == 1) & (labels == 1)).sum()) / (
@@ -259,7 +259,7 @@ def evaluate(args):
     )
 
     print("\n" + "="*40)
-    print(f"🌟 FINAL RESULTS ({config['dataset']['name']})")
+    print(f"FINAL RESULTS ({config['dataset']['name']})")
     print("="*40)
     print(f"AUC            : {metrics['auc']:.4f}")
     print(f"Best F1        : {metrics['best_f1']:.4f}")
