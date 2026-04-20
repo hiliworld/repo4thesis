@@ -164,7 +164,8 @@ class SmartTimeSeriesDataset(Dataset):
         return (seq * self.scale_denom + self.min_val).astype(np.float32)
 
 def get_dataloaders(config_path='config.yaml', return_datasets=False):
-    with open(config_path, 'r') as f:
+    # 统一使用 UTF-8（兼容 BOM），避免在 Windows 默认编码下读取失败
+    with open(config_path, 'r', encoding='utf-8-sig') as f:
         config = yaml.safe_load(f)
     
     # 1. 加载训练集 (计算全局统计量)
