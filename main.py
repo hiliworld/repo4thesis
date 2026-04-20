@@ -157,9 +157,14 @@ def train(args):
         for batch in train_loader:
             x = batch.to(DEVICE)
             optimizer.zero_grad()
-
-            pred, recon, _ = model(x)
-
+            
+            # Forward
+            outputs = model(x)
+            pred = outputs["pred"]
+            recon = outputs["recon"]
+            
+            # Loss Calculation
+            # 任务A: 预测 (Target: x[:,-1,:])
             l_pred = criterion_mse(pred, x[:, -1, :])
             l_recon = criterion_mse(recon, x)
 
@@ -207,32 +212,27 @@ def evaluate(args):
         return
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
-
-    infer_cfg = config.get('inference', {})
-    ema_alpha = float(infer_cfg.get('ema_alpha', 0.2))
-    high_percentile = float(infer_cfg.get('high_percentile', 99.0))
-    low_percentile = float(infer_cfg.get('low_percentile', 95.0))
-
-    print("🚀 Collecting reference scores from train(normal) data...")
-    reference_scores = collect_reference_scores(model, train_dataset, config)
-    high_threshold, low_threshold = compute_reference_thresholds(
-        reference_scores,
-        high_percentile=high_percentile,
-        low_percentile=low_percentile,
-    )
-    config.setdefault('inference', {})['high_threshold'] = high_threshold
-    config['inference']['low_threshold'] = low_threshold
-    print(f"📌 Thresholds | high={high_threshold:.6f}, low={low_threshold:.6f}")
-
-    print("🚀 Online rollout over test sequences...")
-    total_scores = []
-    for seq in tqdm(test_dataset.get_full_sequences()):
-        out = online_rollout_sequence(model, seq, config)
-        total_scores.append(out['total_score'])
-
-    scores = np.concatenate(total_scores) if total_scores else np.array([], dtype=np.float32)
-    scores = smooth_scores_ema(scores, ema_alpha=ema_alpha)
-
+    
+    # 3. 推理 (Inference)
+    scores = []
+    print("🚀 Running Inference...")
+    with torch.no_grad():
+        for x in tqdm(test_loader):
+            x = x.to(DEVICE)
+            outputs = model(x)
+            pred = outputs["pred"]
+            recon = outputs["recon"]
+            
+            # Score = Prediction Error + Reconstruction Error
+            l_pred = torch.mean((pred - x[:, -1, :]) ** 2, dim=1)
+            l_recon = torch.mean((recon - x) ** 2, dim=(1, 2))
+            score = l_pred + l_recon
+            scores.append(score.cpu().numpy())
+            
+    scores = np.concatenate(scores)
+    
+    # 4. 加载标签 (Ground Truth)
+    # 这一步稍微复杂，需要去 dataset 目录找 label
     labels = load_labels(config)
     if labels is None:
         print("⚠️ No labels found. Skipping evaluation metrics.")
