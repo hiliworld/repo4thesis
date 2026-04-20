@@ -1,39 +1,47 @@
 import torch
 import torch.nn as nn
 
+class MultiScaleTemporalHead(nn.Module):
+    """单个多尺度卷积分支。"""
+    def __init__(self, in_channels=1, out_channels=8, kernel_size=3, dropout=0.1):
+        super().__init__()
+        padding = kernel_size // 2
+        mid_channels = max(out_channels // 2, 4)
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, mid_channels, kernel_size=kernel_size, padding=padding),
+            nn.ReLU(),
+            nn.Conv1d(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 class LNT_Conv_Encoder(nn.Module):
-    def __init__(self, input_dim=1, z_dim=16):
+    def __init__(self, input_dim=1, z_dim=16, kernel_sizes=None, head_channels=8, dropout=0.1):
         """
-        基于 LNT 论文的卷积编码器
+        基于 LNT 的多头多尺度时序编码器
         :param input_dim: 输入通道数 (通常是 1，因为我们独立处理每个特征)
         :param z_dim: 输出特征维度
         """
         super(LNT_Conv_Encoder, self).__init__()
-        
-        # 定义卷积层序列
-        # 结构参考 LNT network.py: Conv1d -> ReLU -> Conv1d ...
-        # 我们调整了 stride 和 filter 以适应 window_size=100
-        self.conv_net = nn.Sequential(
-            # Layer 1: [Batch, 1, 100] -> [Batch, 4, 50] (Stride=2)
-            nn.Conv1d(in_channels=input_dim, out_channels=4, kernel_size=3, stride=2, padding=1),
+        kernel_sizes = kernel_sizes or [3, 5, 9, 17]
+        self.heads = nn.ModuleList([
+            MultiScaleTemporalHead(
+                in_channels=input_dim,
+                out_channels=head_channels,
+                kernel_size=k,
+                dropout=dropout,
+            ) for k in kernel_sizes
+        ])
+        fused_in = len(kernel_sizes) * head_channels
+        self.fusion = nn.Sequential(
+            nn.Conv1d(fused_in, z_dim, kernel_size=1),
             nn.ReLU(),
-            
-            # Layer 2: [Batch, 4, 50] -> [Batch, 8, 25] (Stride=2)
-            nn.Conv1d(in_channels=4, out_channels=8, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            
-            # Layer 3: [Batch, 8, 25] -> [Batch, 16, 13] (Stride=2)
-            nn.Conv1d(in_channels=8, out_channels=16, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            
-            # Layer 4: [Batch, 16, 13] -> [Batch, z_dim, 7] (Stride=2)
-            nn.Conv1d(in_channels=16, out_channels=z_dim, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            
-            # 自适应池化：强制把时间维度变成 1
-            # [Batch, z_dim, 7] -> [Batch, z_dim, 1]
-            nn.AdaptiveAvgPool1d(1)
+            nn.AdaptiveAvgPool1d(1),
         )
+        self.norm = nn.LayerNorm(z_dim)
 
     def forward(self, x):
         # x: [Batch, Window, Features] -> [64, 100, 36]
@@ -44,9 +52,12 @@ class LNT_Conv_Encoder(nn.Module):
         # 变换: [64, 100, 36] -> [64, 36, 100] -> [64*36, 1, 100]
         x_reshaped = x.permute(0, 2, 1).contiguous().view(batch_size * num_features, 1, seq_len)
         
-        # 2. 卷积提取特征
+        # 2. 多头多尺度卷积提取特征
+        # out: [64*36, n_heads*head_channels, window]
+        head_outs = [head(x_reshaped) for head in self.heads]
+        multi_scale = torch.cat(head_outs, dim=1)
         # out: [64*36, z_dim, 1]
-        conv_out = self.conv_net(x_reshaped)
+        conv_out = self.fusion(multi_scale)
         
         # 3. 还原维度
         # squeeze: [64*36, z_dim]
@@ -54,5 +65,6 @@ class LNT_Conv_Encoder(nn.Module):
         
         # view: [64, 36, z_dim] -> 变回 [Batch, Nodes, Features] 给 GAT 用
         z_nodes = z_flat.view(batch_size, num_features, -1)
+        z_nodes = self.norm(z_nodes)
         
         return z_nodes

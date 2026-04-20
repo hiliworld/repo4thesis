@@ -57,3 +57,12 @@ train:
   epochs: 70
   lr: 0.0005
   patience: 10
+
+inference:
+  alpha_pred: 1.0
+  beta_recon: 1.0
+  ema_alpha: 0.2
+  high_percentile: 99.0
+  low_percentile: 95.0
+  use_isolation: true
+  replacement_mix: 0.5
