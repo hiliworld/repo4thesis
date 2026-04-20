@@ -23,7 +23,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def load_config(config_path):
-    with open(config_path, 'r') as f:
+    # 在 Windows 环境下避免默认编码（如 gbk）读取 UTF-8 配置时报错
+    with open(config_path, 'r', encoding='utf-8-sig') as f:
         return yaml.safe_load(f)
 
 
@@ -202,7 +203,7 @@ def evaluate(args):
     config = load_config(args.config)
     print(f"🔥 Mode: TEST | Device: {DEVICE}")
 
-    _, _, input_dim, train_dataset, test_dataset = get_dataloaders(args.config, return_datasets=True)
+    _, test_loader, input_dim, train_dataset, test_dataset = get_dataloaders(args.config, return_datasets=True)
     config['dataset']['input_dim'] = input_dim
 
     model = MyFinalModel(config).to(DEVICE)
@@ -212,6 +213,14 @@ def evaluate(args):
         return
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
+
+    infer_cfg = config.get('inference', {})
+    high_threshold = infer_cfg.get('high_threshold')
+    low_threshold = infer_cfg.get('low_threshold')
+
+    if high_threshold is None or low_threshold is None:
+        reference_scores = collect_reference_scores(model, train_dataset, config)
+        high_threshold, low_threshold = compute_reference_thresholds(reference_scores)
     
     # 3. 推理 (Inference)
     scores = []
