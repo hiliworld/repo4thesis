@@ -39,6 +39,10 @@ model:
   prototype:
     use_node_prototype: true
     use_patch_prototype: true
+    use_node_correction: true
+    use_patch_correction: true
+    use_global_prototype: true
+    use_local_prototype: false
     num_node_prototypes: 8
     num_patch_prototypes: 8
     tau_node: 0.1
@@ -46,6 +50,7 @@ model:
     lambda_node: 0.5
     lambda_patch: 0.3
     patch_size: 10
+    fusion_mode: "residual_add"
 
 train:
   batch_size: 256
