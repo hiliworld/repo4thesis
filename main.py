@@ -441,6 +441,8 @@ def train(args):
     lambda_node_proto_loss = float(proto_cfg.get("lambda_node_proto_loss", 0.02))
     lambda_patch_proto_loss = float(proto_cfg.get("lambda_patch_proto_loss", 0.02))
     lambda_corr_loss = float(proto_cfg.get("lambda_corr_loss", 0.005))
+    lambda_node_balance = float(proto_cfg.get("lambda_node_balance", 0.001))
+    lambda_patch_balance = float(proto_cfg.get("lambda_patch_balance", 0.001))
 
     epochs = config["train"]["epochs"]
     patience = config["train"]["patience"]
@@ -488,6 +490,25 @@ def train(args):
             if z_corrected is not None and z_fused is not None:
                 l_corr = torch.mean((z_corrected - z_fused) ** 2)
 
+            l_node_balance = torch.tensor(0.0, device=DEVICE)
+            node_assign = outputs.get("node_assign")
+            if node_assign is not None:
+                mean_node_assign = node_assign.mean(dim=(0, 1))
+                uniform_node = torch.full_like(mean_node_assign, 1.0 / mean_node_assign.numel())
+                l_node_balance = torch.sum(
+                    mean_node_assign * (torch.log(mean_node_assign + 1e-8) - torch.log(uniform_node + 1e-8))
+                )
+
+            l_patch_balance = torch.tensor(0.0, device=DEVICE)
+            patch_assign = outputs.get("patch_assign")
+            if patch_assign is not None:
+                mean_patch_assign = patch_assign.mean(dim=(0, 1))
+                uniform_patch = torch.full_like(mean_patch_assign, 1.0 / mean_patch_assign.numel())
+                l_patch_balance = torch.sum(
+                    mean_patch_assign
+                    * (torch.log(mean_patch_assign + 1e-8) - torch.log(uniform_patch + 1e-8))
+                )
+
             loss = (
                 l_pred
                 + l_recon
@@ -495,6 +516,8 @@ def train(args):
                 + lambda_node_proto_loss * l_node_proto
                 + lambda_patch_proto_loss * l_patch_proto
                 + lambda_corr_loss * l_corr
+                + lambda_node_balance * l_node_balance
+                + lambda_patch_balance * l_patch_balance
             )
 
             loss.backward()
