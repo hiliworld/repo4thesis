@@ -332,6 +332,97 @@ def export_memory_outputs(config, memory_bank):
     print(f"Saved anomaly clusters json: {cluster_json}")
 
 
+def export_latent_audit_outputs(
+    labels,
+    dist_fused_to_proto,
+    dist_corrected_to_proto,
+    correction_norm,
+    total_raw_score,
+    total_corrected_score,
+):
+    os.makedirs("outputs", exist_ok=True)
+    csv_path = "outputs/latent_audit.csv"
+    json_path = "outputs/latent_audit_summary.json"
+
+    audit_df = pd.DataFrame(
+        {
+            "sample_idx": np.arange(len(labels), dtype=np.int64),
+            "label": labels.astype(np.int64),
+            "dist_fused_to_proto": dist_fused_to_proto,
+            "dist_corrected_to_proto": dist_corrected_to_proto,
+            "correction_norm": correction_norm,
+            "total_raw_score": total_raw_score,
+            "total_corrected_score": total_corrected_score,
+        }
+    )
+    audit_df.to_csv(csv_path, index=False)
+
+    normal_mask = labels == 0
+    anomaly_mask = labels == 1
+
+    def _safe_group_mean(values, mask):
+        if np.sum(mask) == 0:
+            return None
+        return float(np.nanmean(values[mask]))
+
+    normal_mean_fused = _safe_group_mean(dist_fused_to_proto, normal_mask)
+    anomaly_mean_fused = _safe_group_mean(dist_fused_to_proto, anomaly_mask)
+    normal_mean_corrected = _safe_group_mean(dist_corrected_to_proto, normal_mask)
+    anomaly_mean_corrected = _safe_group_mean(dist_corrected_to_proto, anomaly_mask)
+    normal_mean_corr_norm = _safe_group_mean(correction_norm, normal_mask)
+    anomaly_mean_corr_norm = _safe_group_mean(correction_norm, anomaly_mask)
+
+    fused_gap = None
+    corrected_gap = None
+    gap_change = None
+    if (anomaly_mean_fused is not None) and (normal_mean_fused is not None):
+        fused_gap = float(anomaly_mean_fused - normal_mean_fused)
+    if (anomaly_mean_corrected is not None) and (normal_mean_corrected is not None):
+        corrected_gap = float(anomaly_mean_corrected - normal_mean_corrected)
+    if (fused_gap is not None) and (corrected_gap is not None):
+        gap_change = float(corrected_gap - fused_gap)
+
+    summary = {
+        "means": {
+            "normal_dist_fused_to_proto": normal_mean_fused,
+            "anomaly_dist_fused_to_proto": anomaly_mean_fused,
+            "normal_dist_corrected_to_proto": normal_mean_corrected,
+            "anomaly_dist_corrected_to_proto": anomaly_mean_corrected,
+            "normal_correction_norm": normal_mean_corr_norm,
+            "anomaly_correction_norm": anomaly_mean_corr_norm,
+        },
+        "judgement": {
+            "corrected_closer_than_fused_on_normal": (
+                bool(normal_mean_corrected < normal_mean_fused)
+                if (normal_mean_corrected is not None and normal_mean_fused is not None)
+                else None
+            ),
+            "corrected_farther_than_fused_on_anomaly": (
+                bool(anomaly_mean_corrected > anomaly_mean_fused)
+                if (anomaly_mean_corrected is not None and anomaly_mean_fused is not None)
+                else None
+            ),
+            "fused_gap_anomaly_minus_normal": fused_gap,
+            "corrected_gap_anomaly_minus_normal": corrected_gap,
+            "gap_change_corrected_minus_fused": gap_change,
+            "separation_enhanced": (bool(gap_change > 0.0) if gap_change is not None else None),
+        },
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print("Latent audit summary")
+    print(f"normal mean dist_fused_to_proto: {normal_mean_fused}")
+    print(f"anomaly mean dist_fused_to_proto: {anomaly_mean_fused}")
+    print(f"normal mean dist_corrected_to_proto: {normal_mean_corrected}")
+    print(f"anomaly mean dist_corrected_to_proto: {anomaly_mean_corrected}")
+    print(f"normal mean correction_norm: {normal_mean_corr_norm}")
+    print(f"anomaly mean correction_norm: {anomaly_mean_corr_norm}")
+    print(f"Saved latent audit csv: {csv_path}")
+    print(f"Saved latent audit summary json: {json_path}")
+
+
 def train(args):
     config = load_config(args.config)
     print(f"Mode: TRAIN | Device: {DEVICE}")
@@ -472,14 +563,6 @@ def evaluate(args):
 
     reference_stats = collect_reference_statistics(model, train_dataset, config)
 
-    reference_arrays = {}
-    for key, st in reference_stats.items():
-        values = []
-        for _ in range(2):
-            values.append(st["mean"] - st["std"])
-            values.append(st["mean"] + st["std"])
-        reference_arrays[key] = np.asarray(values, dtype=np.float32)
-
     raw_ref = []
     corrected_ref = []
     hybrid_ref = []
@@ -508,6 +591,11 @@ def evaluate(args):
     raw_scores = []
     corrected_scores = []
     hybrid_scores = []
+    dist_fused_to_proto = []
+    dist_corrected_to_proto = []
+    correction_norm_list = []
+    total_raw_score_list = []
+    total_corrected_score_list = []
 
     print("Running Inference")
     with torch.no_grad():
@@ -525,21 +613,57 @@ def evaluate(args):
             raw_scores.append(comps["total_raw_score"].detach().cpu().numpy())
             corrected_scores.append(comps["total_corrected_score"].detach().cpu().numpy())
             hybrid_scores.append(zvars["hybrid_score"].detach().cpu().numpy())
+            correction_norm_list.append(comps["correction_norm"].detach().cpu().numpy())
+            total_raw_score_list.append(comps["total_raw_score"].detach().cpu().numpy())
+            total_corrected_score_list.append(comps["total_corrected_score"].detach().cpu().numpy())
+
+            z_fused = outputs.get("z_fused")
+            z_corrected = outputs.get("z_corrected")
+            node_proto_latent = outputs.get("node_proto_latent")
+            if z_fused is not None and z_corrected is not None and node_proto_latent is not None:
+                dist_fused = torch.mean((z_fused - node_proto_latent) ** 2, dim=(1, 2))
+                dist_corrected = torch.mean((z_corrected - node_proto_latent) ** 2, dim=(1, 2))
+                dist_fused_to_proto.append(dist_fused.detach().cpu().numpy())
+                dist_corrected_to_proto.append(dist_corrected.detach().cpu().numpy())
+            else:
+                batch_size = x.shape[0]
+                dist_fused_to_proto.append(np.full((batch_size,), np.nan, dtype=np.float32))
+                dist_corrected_to_proto.append(np.full((batch_size,), np.nan, dtype=np.float32))
 
     raw_scores = np.concatenate(raw_scores)
     corrected_scores = np.concatenate(corrected_scores)
     hybrid_scores = np.concatenate(hybrid_scores)
+    dist_fused_to_proto = np.concatenate(dist_fused_to_proto).astype(np.float32)
+    dist_corrected_to_proto = np.concatenate(dist_corrected_to_proto).astype(np.float32)
+    correction_norm_list = np.concatenate(correction_norm_list).astype(np.float32)
+    total_raw_score_list = np.concatenate(total_raw_score_list).astype(np.float32)
+    total_corrected_score_list = np.concatenate(total_corrected_score_list).astype(np.float32)
 
     labels = load_labels(config)
     if labels is None:
         print("No labels found. Skipping evaluation metrics.")
         return
 
-    min_len = min(len(raw_scores), len(corrected_scores), len(hybrid_scores), len(labels))
+    min_len = min(
+        len(raw_scores),
+        len(corrected_scores),
+        len(hybrid_scores),
+        len(labels),
+        len(dist_fused_to_proto),
+        len(dist_corrected_to_proto),
+        len(correction_norm_list),
+        len(total_raw_score_list),
+        len(total_corrected_score_list),
+    )
     raw_scores = raw_scores[:min_len]
     corrected_scores = corrected_scores[:min_len]
     hybrid_scores = hybrid_scores[:min_len]
     labels = labels[:min_len]
+    dist_fused_to_proto = dist_fused_to_proto[:min_len]
+    dist_corrected_to_proto = dist_corrected_to_proto[:min_len]
+    correction_norm_list = correction_norm_list[:min_len]
+    total_raw_score_list = total_raw_score_list[:min_len]
+    total_corrected_score_list = total_corrected_score_list[:min_len]
 
     raw_diag = branch_diagnostics(raw_scores, labels, raw_ref, infer_cfg)
     corrected_diag = branch_diagnostics(corrected_scores, labels, corrected_ref, infer_cfg)
@@ -565,6 +689,15 @@ def evaluate(args):
         for s in diag["sensitivity"]:
             print(f"  high={s['high']:.6f}, low={s['low']:.6f}, dual_f1={s['dual_f1']:.4f}")
         print("-" * 60)
+
+    export_latent_audit_outputs(
+        labels=labels,
+        dist_fused_to_proto=dist_fused_to_proto,
+        dist_corrected_to_proto=dist_corrected_to_proto,
+        correction_norm=correction_norm_list,
+        total_raw_score=total_raw_score_list,
+        total_corrected_score=total_corrected_score_list,
+    )
 
     if bool(anomaly_space_cfg.get("enable_memory_bank", True)) and bool(infer_cfg.get("save_anomaly_segments", True)):
         memory_bank = AnomalyMemoryBank()
