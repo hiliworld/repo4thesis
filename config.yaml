@@ -26,12 +26,13 @@ dataset:
 model:
   hidden_dim: 64
   z_dim: 32
-  use_prototype_fusion: true
+  lnt_pool_bins: 1
+  use_prototype_fusion: true  # global switch for prototype fusion path
   prototype:
-    use_node_prototype: true
-    use_patch_prototype: true
-    use_node_correction: true
-    use_patch_correction: true
+    use_node_prototype: true  # enable node prototype matching path
+    use_patch_prototype: true  # enable patch prototype matching path
+    use_node_correction: true  # apply node correction into z_corrected
+    use_patch_correction: true  # apply patch correction into z_corrected
     use_global_prototype: true
     use_local_prototype: false
     num_node_prototypes: 8
@@ -53,6 +54,12 @@ train:
   epochs: 70
   lr: 0.0005
   patience: 10
+  recon_mode: "full_window"
+  lambda_recon_last: 1.0
+  lambda_recon_full: 0.2
+  checkpoint_mode: "loss"
+  val_eval_interval: 5
+  val_subset_max_batches: 20
 
 inference:
   alpha_pred: 1.0

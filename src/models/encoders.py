@@ -19,7 +19,7 @@ class MultiScaleTemporalHead(nn.Module):
         return self.net(x)
 
 class LNT_Conv_Encoder(nn.Module):
-    def __init__(self, input_dim=1, z_dim=16, kernel_sizes=None, head_channels=8, dropout=0.1):
+    def __init__(self, input_dim=1, z_dim=16, kernel_sizes=None, head_channels=8, dropout=0.1, pool_bins=1):
         """
         基于 LNT 的多头多尺度时序编码器
         :param input_dim: 输入通道数 (通常是 1，因为我们独立处理每个特征)
@@ -39,8 +39,14 @@ class LNT_Conv_Encoder(nn.Module):
         self.fusion = nn.Sequential(
             nn.Conv1d(fused_in, z_dim, kernel_size=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
         )
+        self.pool_bins = int(pool_bins)
+        if self.pool_bins not in (1, 2):
+            self.pool_bins = 1
+        self.pool = nn.AdaptiveAvgPool1d(self.pool_bins)
+        self.pool_proj = None
+        if self.pool_bins == 2:
+            self.pool_proj = nn.Linear(z_dim * 2, z_dim)
         self.norm = nn.LayerNorm(z_dim)
 
     def forward(self, x):
@@ -56,12 +62,15 @@ class LNT_Conv_Encoder(nn.Module):
         # out: [64*36, n_heads*head_channels, window]
         head_outs = [head(x_reshaped) for head in self.heads]
         multi_scale = torch.cat(head_outs, dim=1)
-        # out: [64*36, z_dim, 1]
         conv_out = self.fusion(multi_scale)
-        
+        conv_out = self.pool(conv_out)
+
         # 3. 还原维度
-        # squeeze: [64*36, z_dim]
-        z_flat = conv_out.squeeze(-1)
+        if self.pool_bins == 1:
+            z_flat = conv_out.squeeze(-1)
+        else:
+            z_flat = conv_out.reshape(batch_size * num_features, -1)
+            z_flat = self.pool_proj(z_flat)
         
         # view: [64, 36, z_dim] -> 变回 [Batch, Nodes, Features] 给 GAT 用
         z_nodes = z_flat.view(batch_size, num_features, -1)

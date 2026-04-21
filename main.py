@@ -2,6 +2,7 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import time
 
 import numpy as np
@@ -383,6 +384,12 @@ def export_latent_audit_outputs(
         gap_change = float(corrected_gap - fused_gap)
 
     summary = {
+        "normal_mean_dist_fused_to_proto": normal_mean_fused,
+        "anomaly_mean_dist_fused_to_proto": anomaly_mean_fused,
+        "normal_mean_dist_corrected_to_proto": normal_mean_corrected,
+        "anomaly_mean_dist_corrected_to_proto": anomaly_mean_corrected,
+        "normal_mean_correction_norm": normal_mean_corr_norm,
+        "anomaly_mean_correction_norm": anomaly_mean_corr_norm,
         "means": {
             "normal_dist_fused_to_proto": normal_mean_fused,
             "anomaly_dist_fused_to_proto": anomaly_mean_fused,
@@ -423,12 +430,135 @@ def export_latent_audit_outputs(
     print(f"Saved latent audit summary json: {json_path}")
 
 
+def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, audit_buffers):
+    os.makedirs("outputs", exist_ok=True)
+    audit_path = "outputs/prototype_path_audit.json"
+
+    proto_cfg = config.get("model", {}).get("prototype", {})
+    switches = {
+        "use_prototype_fusion": bool(config.get("model", {}).get("use_prototype_fusion", False)),
+        "use_node_prototype": bool(proto_cfg.get("use_node_prototype", True)),
+        "use_patch_prototype": bool(proto_cfg.get("use_patch_prototype", True)),
+        "use_node_correction": bool(proto_cfg.get("use_node_correction", True)),
+        "use_patch_correction": bool(proto_cfg.get("use_patch_correction", True)),
+    }
+
+    node_usage = None
+    if len(audit_buffers["node_usage"]) > 0:
+        node_usage = np.mean(np.stack(audit_buffers["node_usage"], axis=0), axis=0).tolist()
+    patch_usage = None
+    if len(audit_buffers["patch_usage"]) > 0:
+        patch_usage = np.mean(np.stack(audit_buffers["patch_usage"], axis=0), axis=0).tolist()
+
+    summary = {
+        "switches": switches,
+        "means": {
+            "node_delta_norm": float(np.mean(audit_buffers["node_delta_norm"])) if audit_buffers["node_delta_norm"] else 0.0,
+            "patch_delta_norm": float(np.mean(audit_buffers["patch_delta_norm"])) if audit_buffers["patch_delta_norm"] else 0.0,
+            "correction_norm": float(np.mean(audit_buffers["correction_norm"])) if audit_buffers["correction_norm"] else 0.0,
+            "node_assignment_entropy": float(np.mean(audit_buffers["node_entropy"])) if audit_buffers["node_entropy"] else 0.0,
+            "patch_assignment_entropy": float(np.mean(audit_buffers["patch_entropy"])) if audit_buffers["patch_entropy"] else 0.0,
+        },
+        "usage_frequency": {
+            "node_prototype_usage": node_usage,
+            "patch_prototype_usage": patch_usage,
+        },
+        "branch_results": {
+            "raw": {
+                "auc": float(raw_diag["metrics"]["auc"]),
+                "best_f1": float(raw_diag["metrics"]["best_f1"]),
+                "f1_pa": float(raw_diag["metrics"]["f1_pa"]),
+                "dual_threshold_f1": float(raw_diag["dual_f1"]),
+                "high_threshold": float(raw_diag["high"]),
+                "low_threshold": float(raw_diag["low"]),
+            },
+            "corrected": {
+                "auc": float(corrected_diag["metrics"]["auc"]),
+                "best_f1": float(corrected_diag["metrics"]["best_f1"]),
+                "f1_pa": float(corrected_diag["metrics"]["f1_pa"]),
+                "dual_threshold_f1": float(corrected_diag["dual_f1"]),
+                "high_threshold": float(corrected_diag["high"]),
+                "low_threshold": float(corrected_diag["low"]),
+            },
+            "hybrid": {
+                "auc": float(hybrid_diag["metrics"]["auc"]),
+                "best_f1": float(hybrid_diag["metrics"]["best_f1"]),
+                "f1_pa": float(hybrid_diag["metrics"]["f1_pa"]),
+                "dual_threshold_f1": float(hybrid_diag["dual_f1"]),
+                "high_threshold": float(hybrid_diag["high"]),
+                "low_threshold": float(hybrid_diag["low"]),
+            },
+        },
+    }
+
+    with open(audit_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"Saved prototype path audit json: {audit_path}")
+
+
+def compute_recon_loss(recon, x, criterion_mse, train_cfg):
+    recon_mode = str(train_cfg.get("recon_mode", "full_window")).lower()
+    lambda_recon_last = float(train_cfg.get("lambda_recon_last", 1.0))
+    lambda_recon_full = float(train_cfg.get("lambda_recon_full", 0.2))
+
+    if recon_mode == "last_point":
+        l_recon = criterion_mse(recon[:, -1, :], x[:, -1, :])
+    elif recon_mode == "mixed":
+        l_recon_last = criterion_mse(recon[:, -1, :], x[:, -1, :])
+        l_recon_full = criterion_mse(recon, x)
+        l_recon = lambda_recon_last * l_recon_last + lambda_recon_full * l_recon_full
+    else:
+        recon_mode = "full_window"
+        l_recon = criterion_mse(recon, x)
+
+    return l_recon, recon_mode, lambda_recon_last, lambda_recon_full
+
+
+def evaluate_subset_for_checkpoint(model, test_loader, labels, config, max_batches=20):
+    infer_cfg = config.get("inference", {})
+    alpha_pred = float(infer_cfg.get("alpha_pred", 1.0))
+    beta_recon = float(infer_cfg.get("beta_recon", 1.0))
+
+    corrected_scores = []
+    model.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(test_loader):
+            if i >= max_batches:
+                break
+            x = batch.to(DEVICE)
+            outputs = model(x)
+            pred_corr = outputs["pred_corrected"]
+            recon_corr = outputs["recon_corrected"]
+            pred_corr_score = torch.mean((pred_corr - x[:, -1, :]) ** 2, dim=1)
+            recon_corr_last_score = torch.mean((recon_corr[:, -1, :] - x[:, -1, :]) ** 2, dim=1)
+            total_corrected_score = alpha_pred * pred_corr_score + beta_recon * recon_corr_last_score
+            corrected_scores.append(total_corrected_score.detach().cpu().numpy())
+
+    if not corrected_scores:
+        return None
+
+    corrected_scores = np.concatenate(corrected_scores).astype(np.float32)
+    if labels is None or len(labels) == 0:
+        return None
+    valid_len = min(len(corrected_scores), len(labels))
+    corrected_scores = corrected_scores[:valid_len]
+    labels = labels[:valid_len]
+    if len(np.unique(labels)) < 2:
+        return None
+
+    metrics = get_best_f1(labels, corrected_scores)
+    return {
+        "auc": float(metrics["auc"]),
+        "pa_f1": float(metrics["f1_pa"]),
+    }
+
+
 def train(args):
     config = load_config(args.config)
     print(f"Mode: TRAIN | Device: {DEVICE}")
     print(f"Config: {args.config}")
 
-    train_loader, _, input_dim = get_dataloaders(args.config)
+    train_loader, test_loader, input_dim = get_dataloaders(args.config)
     config["dataset"]["input_dim"] = input_dim
 
     model = MyFinalModel(config).to(DEVICE)
@@ -449,9 +579,35 @@ def train(args):
     best_loss = float("inf")
     patience_counter = 0
     save_path = "best_model.pth"
+    train_cfg = config.get("train", {})
+    configured_recon_mode = str(train_cfg.get("recon_mode", "full_window")).lower()
+    lambda_recon_last = float(train_cfg.get("lambda_recon_last", 1.0))
+    lambda_recon_full = float(train_cfg.get("lambda_recon_full", 0.2))
+    checkpoint_mode = str(train_cfg.get("checkpoint_mode", "loss")).lower()
+    val_eval_interval = int(train_cfg.get("val_eval_interval", 5))
+    val_subset_max_batches = int(train_cfg.get("val_subset_max_batches", 20))
+    if checkpoint_mode not in ("loss", "pa_f1", "auc"):
+        checkpoint_mode = "loss"
+
+    labels = load_labels(config)
 
     print("Start Training")
+    print(
+        f"Reconstruction mode: {configured_recon_mode} | "
+        f"lambda_recon_last={lambda_recon_last:.4f} | "
+        f"lambda_recon_full={lambda_recon_full:.4f}"
+    )
+    print(
+        f"Checkpoint mode: {checkpoint_mode} | "
+        f"val_eval_interval={val_eval_interval} | "
+        f"val_subset_max_batches={val_subset_max_batches}"
+    )
     model.train()
+    best_loss_path = "best_model_loss.pth"
+    best_pa_f1_path = "best_model_pa_f1.pth"
+    best_auc_path = "best_model_auc.pth"
+    best_pa_f1 = -1.0
+    best_auc = -1.0
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -466,7 +622,12 @@ def train(args):
             recon = outputs["recon"]
 
             l_pred = criterion_mse(pred, x[:, -1, :])
-            l_recon = criterion_mse(recon, x)
+            l_recon, active_recon_mode, lambda_recon_last, lambda_recon_full = compute_recon_loss(
+                recon=recon,
+                x=x,
+                criterion_mse=criterion_mse,
+                train_cfg=train_cfg,
+            )
 
             noise = torch.randn_like(x) * 0.01
             z1 = model.metric_encoder(x)
@@ -532,6 +693,7 @@ def train(args):
             best_loss = avg_loss
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
+            torch.save(model.state_dict(), best_loss_path)
             print(f"Saved Best Model ({avg_loss:.4f})")
         else:
             patience_counter += 1
@@ -539,7 +701,53 @@ def train(args):
                 print("Early Stopping Triggered")
                 break
 
+        if val_eval_interval > 0 and ((epoch + 1) % val_eval_interval == 0):
+            val_metrics = evaluate_subset_for_checkpoint(
+                model=model,
+                test_loader=test_loader,
+                labels=labels,
+                config=config,
+                max_batches=val_subset_max_batches,
+            )
+            if val_metrics is not None:
+                current_pa_f1 = val_metrics["pa_f1"]
+                current_auc = val_metrics["auc"]
+                print(f"Validation subset metrics | PA-F1: {current_pa_f1:.4f} | AUC: {current_auc:.4f}")
+                if current_pa_f1 > best_pa_f1:
+                    best_pa_f1 = current_pa_f1
+                    torch.save(model.state_dict(), best_pa_f1_path)
+                if current_auc > best_auc:
+                    best_auc = current_auc
+                    torch.save(model.state_dict(), best_auc_path)
+            model.train()
+
     print(f"Training Complete. Model saved to {save_path}")
+    source_checkpoint = best_loss_path
+    if checkpoint_mode == "pa_f1" and os.path.exists(best_pa_f1_path):
+        source_checkpoint = best_pa_f1_path
+    elif checkpoint_mode == "auc" and os.path.exists(best_auc_path):
+        source_checkpoint = best_auc_path
+    elif not os.path.exists(best_loss_path):
+        source_checkpoint = save_path
+    if os.path.exists(source_checkpoint):
+        shutil.copyfile(source_checkpoint, save_path)
+
+    os.makedirs("outputs", exist_ok=True)
+    summary_path = "outputs/train_loss_summary.json"
+    train_summary = {
+        "recon_mode": active_recon_mode if "active_recon_mode" in locals() else configured_recon_mode,
+        "lambda_recon_last": float(lambda_recon_last),
+        "lambda_recon_full": float(lambda_recon_full),
+        "best_loss": float(best_loss),
+        "checkpoint_mode": checkpoint_mode,
+        "val_eval_interval": int(val_eval_interval),
+        "val_subset_max_batches": int(val_subset_max_batches),
+        "best_pa_f1": None if best_pa_f1 < 0 else float(best_pa_f1),
+        "best_auc": None if best_auc < 0 else float(best_auc),
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(train_summary, f, ensure_ascii=False, indent=2)
+    print(f"Saved train loss summary: {summary_path}")
 
 
 def evaluate(args):
@@ -596,6 +804,15 @@ def evaluate(args):
     correction_norm_list = []
     total_raw_score_list = []
     total_corrected_score_list = []
+    prototype_audit_buffers = {
+        "node_delta_norm": [],
+        "patch_delta_norm": [],
+        "correction_norm": [],
+        "node_usage": [],
+        "patch_usage": [],
+        "node_entropy": [],
+        "patch_entropy": [],
+    }
 
     print("Running Inference")
     with torch.no_grad():
@@ -629,6 +846,42 @@ def evaluate(args):
                 batch_size = x.shape[0]
                 dist_fused_to_proto.append(np.full((batch_size,), np.nan, dtype=np.float32))
                 dist_corrected_to_proto.append(np.full((batch_size,), np.nan, dtype=np.float32))
+
+            node_delta = outputs.get("node_delta")
+            if node_delta is not None:
+                node_delta_norm = torch.mean(node_delta ** 2, dim=(1, 2))
+                prototype_audit_buffers["node_delta_norm"].append(float(node_delta_norm.mean().item()))
+            else:
+                prototype_audit_buffers["node_delta_norm"].append(0.0)
+
+            patch_delta = outputs.get("patch_delta")
+            if patch_delta is not None:
+                patch_delta_norm = torch.mean(patch_delta ** 2, dim=(1, 2))
+                prototype_audit_buffers["patch_delta_norm"].append(float(patch_delta_norm.mean().item()))
+            else:
+                prototype_audit_buffers["patch_delta_norm"].append(0.0)
+
+            prototype_audit_buffers["correction_norm"].append(float(comps["correction_norm"].mean().item()))
+
+            node_assign = outputs.get("node_assign")
+            if node_assign is not None:
+                prototype_audit_buffers["node_usage"].append(
+                    node_assign.mean(dim=(0, 1)).detach().cpu().numpy()
+                )
+                node_entropy_batch = -(node_assign * torch.log(node_assign + 1e-8)).sum(dim=-1).mean(dim=1)
+                prototype_audit_buffers["node_entropy"].append(float(node_entropy_batch.mean().item()))
+            else:
+                prototype_audit_buffers["node_entropy"].append(0.0)
+
+            patch_assign = outputs.get("patch_assign")
+            if patch_assign is not None:
+                prototype_audit_buffers["patch_usage"].append(
+                    patch_assign.mean(dim=(0, 1)).detach().cpu().numpy()
+                )
+                patch_entropy_batch = -(patch_assign * torch.log(patch_assign + 1e-8)).sum(dim=-1).mean(dim=1)
+                prototype_audit_buffers["patch_entropy"].append(float(patch_entropy_batch.mean().item()))
+            else:
+                prototype_audit_buffers["patch_entropy"].append(0.0)
 
     raw_scores = np.concatenate(raw_scores)
     corrected_scores = np.concatenate(corrected_scores)
@@ -697,6 +950,13 @@ def evaluate(args):
         correction_norm=correction_norm_list,
         total_raw_score=total_raw_score_list,
         total_corrected_score=total_corrected_score_list,
+    )
+    export_prototype_path_audit(
+        config=config,
+        raw_diag=raw_diag,
+        corrected_diag=corrected_diag,
+        hybrid_diag=hybrid_diag,
+        audit_buffers=prototype_audit_buffers,
     )
 
     if bool(anomaly_space_cfg.get("enable_memory_bank", True)) and bool(infer_cfg.get("save_anomaly_segments", True)):
