@@ -1,7 +1,7 @@
 import argparse
 import glob
+import json
 import os
-import pickle
 import time
 
 import numpy as np
@@ -13,6 +13,11 @@ import yaml
 from tqdm import tqdm
 
 from src.data.loader import get_dataloaders
+from src.models.anomaly_memory import (
+    AnomalyMemoryBank,
+    SegmentEmbeddingSchema,
+    cluster_anomaly_segments,
+)
 from src.models.anomaly_model import MyFinalModel
 from src.utils.loss import ContrastiveLoss
 from src.utils.metrics import (
@@ -29,38 +34,83 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-def compute_window_scores(model, x, alpha_pred=1.0, beta_recon=1.0, branch="corrected"):
-    """输出分解后的窗口分数；branch 支持 raw / corrected。"""
-    outputs = model(x)
-    if branch == "raw":
-        pred = outputs["pred_raw"]
-        recon = outputs["recon_raw"]
-    else:
-        pred = outputs["pred_corrected"]
-        recon = outputs["recon_corrected"]
+def compute_score_components(outputs, x, alpha_pred=1.0, beta_recon=1.0):
+    pred_raw = outputs["pred_raw"]
+    pred_corrected = outputs["pred_corrected"]
+    recon_raw = outputs["recon_raw"]
+    recon_corrected = outputs["recon_corrected"]
 
-    pred_score = torch.mean((pred - x[:, -1, :]) ** 2, dim=1)
-    recon_last_score = torch.mean((recon[:, -1, :] - x[:, -1, :]) ** 2, dim=1)
-    recon_full_score = torch.mean((recon - x) ** 2, dim=(1, 2))
-    total_score = alpha_pred * pred_score + beta_recon * recon_last_score
+    pred_raw_score = torch.mean((pred_raw - x[:, -1, :]) ** 2, dim=1)
+    pred_corrected_score = torch.mean((pred_corrected - x[:, -1, :]) ** 2, dim=1)
+    recon_raw_last_score = torch.mean((recon_raw[:, -1, :] - x[:, -1, :]) ** 2, dim=1)
+    recon_corrected_last_score = torch.mean((recon_corrected[:, -1, :] - x[:, -1, :]) ** 2, dim=1)
+
+    total_raw_score = alpha_pred * pred_raw_score + beta_recon * recon_raw_last_score
+    total_corrected_score = alpha_pred * pred_corrected_score + beta_recon * recon_corrected_last_score
+
+    branch_gap = torch.abs(total_corrected_score - total_raw_score)
+    correction_norm = torch.mean((outputs["z_corrected"] - outputs["z_fused"]) ** 2, dim=(1, 2))
+
+    node_assign = outputs.get("node_assign")
+    if node_assign is not None:
+        node_entropy_map = -(node_assign * torch.log(node_assign + 1e-8)).sum(dim=-1)
+        node_entropy = node_entropy_map.mean(dim=1)
+    else:
+        node_entropy = torch.zeros_like(total_raw_score)
+
+    patch_assign = outputs.get("patch_assign")
+    if patch_assign is not None:
+        patch_entropy_map = -(patch_assign * torch.log(patch_assign + 1e-8)).sum(dim=-1)
+        patch_entropy = patch_entropy_map.mean(dim=1)
+    else:
+        patch_entropy = torch.zeros_like(total_raw_score)
+
+    prototype_uncertainty = 0.5 * (node_entropy + patch_entropy)
+
+    residual_time = torch.mean((recon_corrected - x) ** 2, dim=2)
+    last_residual = residual_time[:, -1]
+    if residual_time.shape[1] > 1:
+        hist_mean = residual_time[:, :-1].mean(dim=1)
+    else:
+        hist_mean = last_residual
+    spike_score = torch.abs(last_residual - hist_mean)
+
     return {
-        "pred_score": pred_score,
-        "recon_last_score": recon_last_score,
-        "recon_full_score": recon_full_score,
-        "total_score": total_score,
-        "pred": pred,
-        "recon": recon,
+        "pred_raw_score": pred_raw_score,
+        "pred_corrected_score": pred_corrected_score,
+        "recon_raw_last_score": recon_raw_last_score,
+        "recon_corrected_last_score": recon_corrected_last_score,
+        "total_raw_score": total_raw_score,
+        "total_corrected_score": total_corrected_score,
+        "branch_gap": branch_gap,
+        "correction_norm": correction_norm,
+        "node_entropy": node_entropy,
+        "patch_entropy": patch_entropy,
+        "prototype_uncertainty": prototype_uncertainty,
+        "spike_score": spike_score,
     }
 
 
-def collect_reference_scores(model, train_dataset, config, branch="corrected"):
-    """在训练集正常样本上收集参考分数分布。"""
+def _init_reference_buffer():
+    return {
+        "total_raw_score": [],
+        "total_corrected_score": [],
+        "branch_gap": [],
+        "correction_norm": [],
+        "node_entropy": [],
+        "patch_entropy": [],
+        "prototype_uncertainty": [],
+        "spike_score": [],
+    }
+
+
+def collect_reference_statistics(model, train_dataset, config):
     infer_cfg = config.get("inference", {})
     alpha_pred = float(infer_cfg.get("alpha_pred", 1.0))
     beta_recon = float(infer_cfg.get("beta_recon", 1.0))
 
     model.eval()
-    reference_scores = []
+    ref_buf = _init_reference_buffer()
     with torch.no_grad():
         for seq in train_dataset.get_full_sequences():
             if len(seq) < train_dataset.window_size:
@@ -68,78 +118,97 @@ def collect_reference_scores(model, train_dataset, config, branch="corrected"):
             for t in range(train_dataset.window_size - 1, len(seq)):
                 window = seq[t - train_dataset.window_size + 1 : t + 1]
                 x = torch.from_numpy(window).unsqueeze(0).to(DEVICE)
-                ws = compute_window_scores(model, x, alpha_pred, beta_recon, branch=branch)
-                reference_scores.append(float(ws["total_score"].item()))
+                outputs = model(x)
+                comps = compute_score_components(outputs, x, alpha_pred=alpha_pred, beta_recon=beta_recon)
+                for k in ref_buf:
+                    ref_buf[k].append(float(comps[k].item()))
 
-    return np.asarray(reference_scores, dtype=np.float32)
+    stats = {}
+    for k, values in ref_buf.items():
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            stats[k] = {"mean": 0.0, "std": 1.0}
+        else:
+            stats[k] = {"mean": float(arr.mean()), "std": float(arr.std() + 1e-8)}
+    return stats
 
 
-def online_rollout_sequence_with_branch(model, sequence, config, branch="corrected"):
-    """
-    在线滚动打分（分支版）：
-    - raw 分支：基于 z_fused
-    - corrected 分支：基于 z_corrected
-    """
-    infer_cfg = config.get("inference", {})
-    window_size = int(config["dataset"]["window_size"])
-    alpha_pred = float(infer_cfg.get("alpha_pred", 1.0))
-    beta_recon = float(infer_cfg.get("beta_recon", 1.0))
+def zscore_with_reference(values, stat_entry):
+    return (values - stat_entry["mean"]) / (stat_entry["std"] + 1e-8)
 
-    seq = np.asarray(sequence, dtype=np.float32)
-    total_scores = []
-    z_fused_mean = []
-    z_corrected_mean = []
-    node_assign_hist = []
-    patch_assign_hist = []
 
-    model.eval()
-    with torch.no_grad():
-        for t in range(window_size - 1, len(seq)):
-            window = seq[t - window_size + 1 : t + 1]
-            x = torch.from_numpy(window).unsqueeze(0).to(DEVICE)
-            outputs = model(x)
+def compute_hybrid_score(components, ref_stats, infer_cfg):
+    raw_total_z = zscore_with_reference(components["total_raw_score"], ref_stats["total_raw_score"])
+    corrected_total_z = zscore_with_reference(
+        components["total_corrected_score"], ref_stats["total_corrected_score"]
+    )
+    branch_gap_z = zscore_with_reference(components["branch_gap"], ref_stats["branch_gap"])
+    correction_norm_z = zscore_with_reference(components["correction_norm"], ref_stats["correction_norm"])
+    node_entropy_z = zscore_with_reference(components["node_entropy"], ref_stats["node_entropy"])
+    patch_entropy_z = zscore_with_reference(components["patch_entropy"], ref_stats["patch_entropy"])
+    prototype_uncertainty_z = zscore_with_reference(
+        components["prototype_uncertainty"], ref_stats["prototype_uncertainty"]
+    )
+    spike_score_z = zscore_with_reference(components["spike_score"], ref_stats["spike_score"])
 
-            if branch == "raw":
-                pred = outputs["pred_raw"]
-                recon = outputs["recon_raw"]
-            else:
-                pred = outputs["pred_corrected"]
-                recon = outputs["recon_corrected"]
+    w1 = float(infer_cfg.get("hybrid_w_corrected", 1.0))
+    w2 = float(infer_cfg.get("hybrid_w_corr_norm", 0.35))
+    w3 = float(infer_cfg.get("hybrid_w_branch_gap", 0.25))
+    w4 = float(infer_cfg.get("hybrid_w_proto_uncertainty", 0.20))
+    w5 = float(infer_cfg.get("hybrid_w_spike", 0.30))
 
-            pred_score = torch.mean((pred - x[:, -1, :]) ** 2, dim=1)
-            recon_last = torch.mean((recon[:, -1, :] - x[:, -1, :]) ** 2, dim=1)
-            score_total = alpha_pred * pred_score + beta_recon * recon_last
-            total_scores.append(float(score_total.item()))
-
-            z_fused_mean.append(float(outputs["z_fused"].mean().item()))
-            z_corrected_mean.append(float(outputs["z_corrected"].mean().item()))
-
-            node_assign = outputs.get("node_assign")
-            if node_assign is not None:
-                node_assign_hist.append(node_assign.mean(dim=(0, 1)).detach().cpu().numpy())
-            else:
-                node_assign_hist.append(None)
-
-            patch_assign = outputs.get("patch_assign")
-            if patch_assign is not None:
-                patch_assign_hist.append(patch_assign.mean(dim=(0, 1)).detach().cpu().numpy())
-            else:
-                patch_assign_hist.append(None)
+    hybrid_score = (
+        w1 * corrected_total_z
+        + w2 * correction_norm_z
+        + w3 * branch_gap_z
+        + w4 * prototype_uncertainty_z
+        + w5 * spike_score_z
+    )
 
     return {
-        "total_score": np.asarray(total_scores, dtype=np.float32),
-        "z_fused_mean": z_fused_mean,
-        "z_corrected_mean": z_corrected_mean,
-        "node_assign_hist": node_assign_hist,
-        "patch_assign_hist": patch_assign_hist,
+        "raw_total_z": raw_total_z,
+        "corrected_total_z": corrected_total_z,
+        "branch_gap_z": branch_gap_z,
+        "correction_norm_z": correction_norm_z,
+        "node_entropy_z": node_entropy_z,
+        "patch_entropy_z": patch_entropy_z,
+        "prototype_uncertainty_z": prototype_uncertainty_z,
+        "spike_score_z": spike_score_z,
+        "hybrid_score": hybrid_score,
     }
 
 
-def build_anomaly_segments(score_series, high_threshold, low_threshold):
-    """
-    将分数序列转换为连续异常段。
-    返回段结构：start_idx/end_idx/length/peak_score/mean_score。
-    """
+def branch_diagnostics(scores, labels, ref_scores, infer_cfg):
+    high_percentile = float(infer_cfg.get("high_percentile", 99.0))
+    low_percentile = float(infer_cfg.get("low_percentile", 95.0))
+    high, low = compute_reference_thresholds(ref_scores, high_percentile=high_percentile, low_percentile=low_percentile)
+
+    preds = apply_dual_threshold_state_machine(scores, high, low)
+    dual_f1 = (2 * ((preds == 1) & (labels == 1)).sum()) / ((preds == 1).sum() + (labels == 1).sum() + 1e-10)
+
+    best = get_best_f1(labels, scores)
+
+    sensitivity = []
+    delta_opts = [(-0.5, -0.5), (0.0, 0.0), (0.5, 0.5)]
+    for dh, dl in delta_opts:
+        h = np.percentile(ref_scores, high_percentile + dh)
+        l = np.percentile(ref_scores, low_percentile + dl)
+        if l > h:
+            l = h
+        p = apply_dual_threshold_state_machine(scores, h, l)
+        f1 = (2 * ((p == 1) & (labels == 1)).sum()) / ((p == 1).sum() + (labels == 1).sum() + 1e-10)
+        sensitivity.append({"high": float(h), "low": float(l), "dual_f1": float(f1)})
+
+    return {
+        "metrics": best,
+        "dual_f1": float(dual_f1),
+        "high": float(high),
+        "low": float(low),
+        "sensitivity": sensitivity,
+    }
+
+
+def build_anomaly_segments(score_series, high_threshold, low_threshold, min_persistence=1):
     segments = []
     in_anomaly = False
     seg_start = None
@@ -150,56 +219,208 @@ def build_anomaly_segments(score_series, high_threshold, low_threshold):
             seg_start = i
         elif in_anomaly and s <= low_threshold:
             seg_scores = score_series[seg_start : i + 1]
-            segments.append(
-                {
-                    "start_idx": int(seg_start),
-                    "end_idx": int(i),
-                    "length": int(i - seg_start + 1),
-                    "peak_score": float(np.max(seg_scores)),
-                    "mean_score": float(np.mean(seg_scores)),
-                }
-            )
+            length = int(i - seg_start + 1)
+            if length >= int(min_persistence):
+                segments.append(
+                    {
+                        "start_idx": int(seg_start),
+                        "end_idx": int(i),
+                        "length": length,
+                        "peak_score": float(np.max(seg_scores)),
+                        "mean_score": float(np.mean(seg_scores)),
+                    }
+                )
             in_anomaly = False
             seg_start = None
 
     if in_anomaly and seg_start is not None:
         seg_scores = score_series[seg_start:]
-        segments.append(
-            {
-                "start_idx": int(seg_start),
-                "end_idx": int(len(score_series) - 1),
-                "length": int(len(score_series) - seg_start),
-                "peak_score": float(np.max(seg_scores)),
-                "mean_score": float(np.mean(seg_scores)),
-            }
-        )
+        length = int(len(score_series) - seg_start)
+        if length >= int(min_persistence):
+            segments.append(
+                {
+                    "start_idx": int(seg_start),
+                    "end_idx": int(len(score_series) - 1),
+                    "length": length,
+                    "peak_score": float(np.max(seg_scores)),
+                    "mean_score": float(np.mean(seg_scores)),
+                }
+            )
 
     return segments
 
 
-def export_anomaly_segments(config, segment_rows):
-    """
-    导出异常段：
-    - CSV：便于快速查阅
-    - PKL：保留复杂字段（如 assignment 直方图）
+def online_rollout_sequence(model, sequence, config, ref_stats):
+    infer_cfg = config.get("inference", {})
+    window_size = int(config["dataset"]["window_size"])
+    alpha_pred = float(infer_cfg.get("alpha_pred", 1.0))
+    beta_recon = float(infer_cfg.get("beta_recon", 1.0))
 
-    字段说明：
-    file_id/start_idx/end_idx/length/peak_score/mean_score 是基础异常段信息；
-    z_fused_mean/z_corrected_mean/node_assign_hist/patch_assign_hist 是可选原型相关诊断信息。
-    """
+    seq = np.asarray(sequence, dtype=np.float32)
+    out = {
+        "raw_score": [],
+        "corrected_score": [],
+        "hybrid_score": [],
+        "z_fused_mean": [],
+        "z_corrected_mean": [],
+        "node_assign_hist": [],
+        "patch_assign_hist": [],
+        "node_delta_mean": [],
+        "patch_delta_mean": [],
+        "correction_norm": [],
+    }
+
+    model.eval()
+    with torch.no_grad():
+        for t in range(window_size - 1, len(seq)):
+            window = seq[t - window_size + 1 : t + 1]
+            x = torch.from_numpy(window).unsqueeze(0).to(DEVICE)
+            outputs = model(x)
+            comps = compute_score_components(outputs, x, alpha_pred=alpha_pred, beta_recon=beta_recon)
+            zvars = compute_hybrid_score(comps, ref_stats, infer_cfg)
+
+            out["raw_score"].append(float(comps["total_raw_score"].item()))
+            out["corrected_score"].append(float(comps["total_corrected_score"].item()))
+            out["hybrid_score"].append(float(zvars["hybrid_score"].item()))
+
+            out["z_fused_mean"].append(outputs["z_fused"].mean(dim=1).squeeze(0).detach().cpu().numpy())
+            out["z_corrected_mean"].append(outputs["z_corrected"].mean(dim=1).squeeze(0).detach().cpu().numpy())
+
+            node_assign = outputs.get("node_assign")
+            if node_assign is not None:
+                out["node_assign_hist"].append(node_assign.mean(dim=(0, 1)).detach().cpu().numpy())
+            else:
+                out["node_assign_hist"].append(None)
+
+            patch_assign = outputs.get("patch_assign")
+            if patch_assign is not None:
+                out["patch_assign_hist"].append(patch_assign.mean(dim=(0, 1)).detach().cpu().numpy())
+            else:
+                out["patch_assign_hist"].append(None)
+
+            node_delta = outputs.get("node_delta")
+            out["node_delta_mean"].append(float(node_delta.mean().item()) if node_delta is not None else 0.0)
+
+            patch_delta = outputs.get("patch_delta")
+            out["patch_delta_mean"].append(float(patch_delta.mean().item()) if patch_delta is not None else 0.0)
+
+            out["correction_norm"].append(float(comps["correction_norm"].item()))
+
+    for k in ["raw_score", "corrected_score", "hybrid_score", "node_delta_mean", "patch_delta_mean", "correction_norm"]:
+        out[k] = np.asarray(out[k], dtype=np.float32)
+    return out
+
+
+def export_memory_outputs(config, memory_bank):
     infer_cfg = config.get("inference", {})
     csv_path = infer_cfg.get("anomaly_segment_csv", "outputs/anomaly_segments.csv")
     pkl_path = infer_cfg.get("anomaly_segment_pkl", "outputs/anomaly_segments.pkl")
+    cluster_json = infer_cfg.get("anomaly_cluster_json", "outputs/anomaly_clusters.json")
 
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
+    os.makedirs(os.path.dirname(cluster_json), exist_ok=True)
 
-    pd.DataFrame(segment_rows).to_csv(csv_path, index=False)
-    with open(pkl_path, "wb") as f:
-        pickle.dump(segment_rows, f)
+    memory_bank.export_csv(csv_path)
+    memory_bank.save_pkl(pkl_path)
+
+    with open(cluster_json, "w", encoding="utf-8") as f:
+        json.dump(memory_bank.cluster_metadata, f, ensure_ascii=False, indent=2)
 
     print(f"Saved anomaly segments csv: {csv_path}")
     print(f"Saved anomaly segments pkl: {pkl_path}")
+    print(f"Saved anomaly clusters json: {cluster_json}")
+
+
+def export_latent_audit_outputs(
+    labels,
+    dist_fused_to_proto,
+    dist_corrected_to_proto,
+    correction_norm,
+    total_raw_score,
+    total_corrected_score,
+):
+    os.makedirs("outputs", exist_ok=True)
+    csv_path = "outputs/latent_audit.csv"
+    json_path = "outputs/latent_audit_summary.json"
+
+    audit_df = pd.DataFrame(
+        {
+            "sample_idx": np.arange(len(labels), dtype=np.int64),
+            "label": labels.astype(np.int64),
+            "dist_fused_to_proto": dist_fused_to_proto,
+            "dist_corrected_to_proto": dist_corrected_to_proto,
+            "correction_norm": correction_norm,
+            "total_raw_score": total_raw_score,
+            "total_corrected_score": total_corrected_score,
+        }
+    )
+    audit_df.to_csv(csv_path, index=False)
+
+    normal_mask = labels == 0
+    anomaly_mask = labels == 1
+
+    def _safe_group_mean(values, mask):
+        if np.sum(mask) == 0:
+            return None
+        return float(np.nanmean(values[mask]))
+
+    normal_mean_fused = _safe_group_mean(dist_fused_to_proto, normal_mask)
+    anomaly_mean_fused = _safe_group_mean(dist_fused_to_proto, anomaly_mask)
+    normal_mean_corrected = _safe_group_mean(dist_corrected_to_proto, normal_mask)
+    anomaly_mean_corrected = _safe_group_mean(dist_corrected_to_proto, anomaly_mask)
+    normal_mean_corr_norm = _safe_group_mean(correction_norm, normal_mask)
+    anomaly_mean_corr_norm = _safe_group_mean(correction_norm, anomaly_mask)
+
+    fused_gap = None
+    corrected_gap = None
+    gap_change = None
+    if (anomaly_mean_fused is not None) and (normal_mean_fused is not None):
+        fused_gap = float(anomaly_mean_fused - normal_mean_fused)
+    if (anomaly_mean_corrected is not None) and (normal_mean_corrected is not None):
+        corrected_gap = float(anomaly_mean_corrected - normal_mean_corrected)
+    if (fused_gap is not None) and (corrected_gap is not None):
+        gap_change = float(corrected_gap - fused_gap)
+
+    summary = {
+        "means": {
+            "normal_dist_fused_to_proto": normal_mean_fused,
+            "anomaly_dist_fused_to_proto": anomaly_mean_fused,
+            "normal_dist_corrected_to_proto": normal_mean_corrected,
+            "anomaly_dist_corrected_to_proto": anomaly_mean_corrected,
+            "normal_correction_norm": normal_mean_corr_norm,
+            "anomaly_correction_norm": anomaly_mean_corr_norm,
+        },
+        "judgement": {
+            "corrected_closer_than_fused_on_normal": (
+                bool(normal_mean_corrected < normal_mean_fused)
+                if (normal_mean_corrected is not None and normal_mean_fused is not None)
+                else None
+            ),
+            "corrected_farther_than_fused_on_anomaly": (
+                bool(anomaly_mean_corrected > anomaly_mean_fused)
+                if (anomaly_mean_corrected is not None and anomaly_mean_fused is not None)
+                else None
+            ),
+            "fused_gap_anomaly_minus_normal": fused_gap,
+            "corrected_gap_anomaly_minus_normal": corrected_gap,
+            "gap_change_corrected_minus_fused": gap_change,
+            "separation_enhanced": (bool(gap_change > 0.0) if gap_change is not None else None),
+        },
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print("Latent audit summary")
+    print(f"normal mean dist_fused_to_proto: {normal_mean_fused}")
+    print(f"anomaly mean dist_fused_to_proto: {anomaly_mean_fused}")
+    print(f"normal mean dist_corrected_to_proto: {normal_mean_corrected}")
+    print(f"anomaly mean dist_corrected_to_proto: {anomaly_mean_corrected}")
+    print(f"normal mean correction_norm: {normal_mean_corr_norm}")
+    print(f"anomaly mean correction_norm: {anomaly_mean_corr_norm}")
+    print(f"Saved latent audit csv: {csv_path}")
+    print(f"Saved latent audit summary json: {json_path}")
 
 
 def train(args):
@@ -227,11 +448,11 @@ def train(args):
     patience_counter = 0
     save_path = "best_model.pth"
 
-    print("\nStart Training...")
+    print("Start Training")
     model.train()
 
     for epoch in range(epochs):
-        epoch_loss = 0
+        epoch_loss = 0.0
         start = time.time()
 
         for batch in train_loader:
@@ -278,7 +499,7 @@ def train(args):
 
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
+            epoch_loss += float(loss.item())
 
         avg_loss = epoch_loss / len(train_loader)
         cost = time.time() - start
@@ -288,11 +509,11 @@ def train(args):
             best_loss = avg_loss
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"   Saved Best Model ({avg_loss:.4f})")
+            print(f"Saved Best Model ({avg_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print("Early Stopping Triggered.")
+                print("Early Stopping Triggered")
                 break
 
     print(f"Training Complete. Model saved to {save_path}")
@@ -310,144 +531,227 @@ def evaluate(args):
     if not os.path.exists(model_path):
         print(f"Error: Model file {model_path} not found. Run train first.")
         return
+
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
 
     infer_cfg = config.get("inference", {})
+    anomaly_space_cfg = config.get("anomaly_space", {})
 
-    corrected_ref_scores = collect_reference_scores(model, train_dataset, config, branch="corrected")
-    raw_ref_scores = collect_reference_scores(model, train_dataset, config, branch="raw")
+    reference_stats = collect_reference_statistics(model, train_dataset, config)
 
-    corrected_high, corrected_low = compute_reference_thresholds(
-        corrected_ref_scores,
-        high_percentile=float(infer_cfg.get("high_percentile", 99.0)),
-        low_percentile=float(infer_cfg.get("low_percentile", 95.0)),
-    )
-    raw_high, raw_low = compute_reference_thresholds(
-        raw_ref_scores,
-        high_percentile=float(infer_cfg.get("high_percentile", 99.0)),
-        low_percentile=float(infer_cfg.get("low_percentile", 95.0)),
-    )
+    raw_ref = []
+    corrected_ref = []
+    hybrid_ref = []
+    with torch.no_grad():
+        for seq in train_dataset.get_full_sequences():
+            if len(seq) < train_dataset.window_size:
+                continue
+            for t in range(train_dataset.window_size - 1, len(seq)):
+                x = torch.from_numpy(seq[t - train_dataset.window_size + 1 : t + 1]).unsqueeze(0).to(DEVICE)
+                outputs = model(x)
+                comps = compute_score_components(
+                    outputs,
+                    x,
+                    alpha_pred=float(infer_cfg.get("alpha_pred", 1.0)),
+                    beta_recon=float(infer_cfg.get("beta_recon", 1.0)),
+                )
+                zvars = compute_hybrid_score(comps, reference_stats, infer_cfg)
+                raw_ref.append(float(comps["total_raw_score"].item()))
+                corrected_ref.append(float(comps["total_corrected_score"].item()))
+                hybrid_ref.append(float(zvars["hybrid_score"].item()))
+
+    raw_ref = np.asarray(raw_ref, dtype=np.float32)
+    corrected_ref = np.asarray(corrected_ref, dtype=np.float32)
+    hybrid_ref = np.asarray(hybrid_ref, dtype=np.float32)
 
     raw_scores = []
     corrected_scores = []
-    node_assign_acc = []
-    patch_assign_acc = []
+    hybrid_scores = []
+    dist_fused_to_proto = []
+    dist_corrected_to_proto = []
+    correction_norm_list = []
+    total_raw_score_list = []
+    total_corrected_score_list = []
 
-    print("Running Inference...")
+    print("Running Inference")
     with torch.no_grad():
         for x in tqdm(test_loader):
             x = x.to(DEVICE)
             outputs = model(x)
+            comps = compute_score_components(
+                outputs,
+                x,
+                alpha_pred=float(infer_cfg.get("alpha_pred", 1.0)),
+                beta_recon=float(infer_cfg.get("beta_recon", 1.0)),
+            )
+            zvars = compute_hybrid_score(comps, reference_stats, infer_cfg)
 
-            pred_raw = outputs["pred_raw"]
-            recon_raw = outputs["recon_raw"]
-            pred_corr = outputs["pred_corrected"]
-            recon_corr = outputs["recon_corrected"]
+            raw_scores.append(comps["total_raw_score"].detach().cpu().numpy())
+            corrected_scores.append(comps["total_corrected_score"].detach().cpu().numpy())
+            hybrid_scores.append(zvars["hybrid_score"].detach().cpu().numpy())
+            correction_norm_list.append(comps["correction_norm"].detach().cpu().numpy())
+            total_raw_score_list.append(comps["total_raw_score"].detach().cpu().numpy())
+            total_corrected_score_list.append(comps["total_corrected_score"].detach().cpu().numpy())
 
-            l_pred_raw = torch.mean((pred_raw - x[:, -1, :]) ** 2, dim=1)
-            l_recon_raw = torch.mean((recon_raw - x) ** 2, dim=(1, 2))
-            l_pred_corr = torch.mean((pred_corr - x[:, -1, :]) ** 2, dim=1)
-            l_recon_corr = torch.mean((recon_corr - x) ** 2, dim=(1, 2))
-
-            raw_scores.append((l_pred_raw + l_recon_raw).cpu().numpy())
-            corrected_scores.append((l_pred_corr + l_recon_corr).cpu().numpy())
-
-            if outputs.get("node_assign") is not None:
-                node_assign_acc.append(outputs["node_assign"].mean(dim=(0, 1)).detach().cpu().numpy())
-            if outputs.get("patch_assign") is not None:
-                patch_assign_acc.append(outputs["patch_assign"].mean(dim=(0, 1)).detach().cpu().numpy())
+            z_fused = outputs.get("z_fused")
+            z_corrected = outputs.get("z_corrected")
+            node_proto_latent = outputs.get("node_proto_latent")
+            if z_fused is not None and z_corrected is not None and node_proto_latent is not None:
+                dist_fused = torch.mean((z_fused - node_proto_latent) ** 2, dim=(1, 2))
+                dist_corrected = torch.mean((z_corrected - node_proto_latent) ** 2, dim=(1, 2))
+                dist_fused_to_proto.append(dist_fused.detach().cpu().numpy())
+                dist_corrected_to_proto.append(dist_corrected.detach().cpu().numpy())
+            else:
+                batch_size = x.shape[0]
+                dist_fused_to_proto.append(np.full((batch_size,), np.nan, dtype=np.float32))
+                dist_corrected_to_proto.append(np.full((batch_size,), np.nan, dtype=np.float32))
 
     raw_scores = np.concatenate(raw_scores)
     corrected_scores = np.concatenate(corrected_scores)
+    hybrid_scores = np.concatenate(hybrid_scores)
+    dist_fused_to_proto = np.concatenate(dist_fused_to_proto).astype(np.float32)
+    dist_corrected_to_proto = np.concatenate(dist_corrected_to_proto).astype(np.float32)
+    correction_norm_list = np.concatenate(correction_norm_list).astype(np.float32)
+    total_raw_score_list = np.concatenate(total_raw_score_list).astype(np.float32)
+    total_corrected_score_list = np.concatenate(total_corrected_score_list).astype(np.float32)
 
     labels = load_labels(config)
     if labels is None:
         print("No labels found. Skipping evaluation metrics.")
         return
 
-    min_len = min(len(raw_scores), len(corrected_scores), len(labels))
+    min_len = min(
+        len(raw_scores),
+        len(corrected_scores),
+        len(hybrid_scores),
+        len(labels),
+        len(dist_fused_to_proto),
+        len(dist_corrected_to_proto),
+        len(correction_norm_list),
+        len(total_raw_score_list),
+        len(total_corrected_score_list),
+    )
     raw_scores = raw_scores[:min_len]
     corrected_scores = corrected_scores[:min_len]
+    hybrid_scores = hybrid_scores[:min_len]
     labels = labels[:min_len]
+    dist_fused_to_proto = dist_fused_to_proto[:min_len]
+    dist_corrected_to_proto = dist_corrected_to_proto[:min_len]
+    correction_norm_list = correction_norm_list[:min_len]
+    total_raw_score_list = total_raw_score_list[:min_len]
+    total_corrected_score_list = total_corrected_score_list[:min_len]
 
-    print("Calculating Metrics...")
-    raw_metrics = get_best_f1(labels, raw_scores)
-    corrected_metrics = get_best_f1(labels, corrected_scores)
+    raw_diag = branch_diagnostics(raw_scores, labels, raw_ref, infer_cfg)
+    corrected_diag = branch_diagnostics(corrected_scores, labels, corrected_ref, infer_cfg)
+    hybrid_diag = branch_diagnostics(hybrid_scores, labels, hybrid_ref, infer_cfg)
 
-    raw_state_preds = apply_dual_threshold_state_machine(raw_scores, raw_high, raw_low)
-    corrected_state_preds = apply_dual_threshold_state_machine(corrected_scores, corrected_high, corrected_low)
-
-    raw_dual_f1 = (2 * ((raw_state_preds == 1) & (labels == 1)).sum()) / (
-        (raw_state_preds == 1).sum() + (labels == 1).sum() + 1e-10
-    )
-    corrected_dual_f1 = (2 * ((corrected_state_preds == 1) & (labels == 1)).sum()) / (
-        (corrected_state_preds == 1).sum() + (labels == 1).sum() + 1e-10
-    )
-
-    print("\n" + "=" * 40)
+    print("\n" + "=" * 60)
     print(f"FINAL RESULTS ({config['dataset']['name']})")
-    print("=" * 40)
-    print("[Raw Branch]")
-    print(f"AUC            : {raw_metrics['auc']:.4f}")
-    print(f"Best F1        : {raw_metrics['best_f1']:.4f}")
-    print(f"PA F1          : {raw_metrics['f1_pa']:.4f}")
-    print(f"Dual-TH F1     : {raw_dual_f1:.4f}")
-    print(f"High/Low TH    : {raw_high:.6f} / {raw_low:.6f}")
-    print("-" * 40)
-    print("[Corrected Branch]")
-    print(f"AUC            : {corrected_metrics['auc']:.4f}")
-    print(f"Best F1        : {corrected_metrics['best_f1']:.4f}")
-    print(f"PA F1          : {corrected_metrics['f1_pa']:.4f}")
-    print(f"Dual-TH F1     : {corrected_dual_f1:.4f}")
-    print(f"High/Low TH    : {corrected_high:.6f} / {corrected_low:.6f}")
-    print("=" * 40)
+    print("=" * 60)
+    for name, diag in [
+        ("Raw", raw_diag),
+        ("Corrected", corrected_diag),
+        ("Hybrid", hybrid_diag),
+    ]:
+        m = diag["metrics"]
+        print(f"[{name} Branch]")
+        print(f"AUC            : {m['auc']:.4f}")
+        print(f"Best F1        : {m['best_f1']:.4f}")
+        print(f"PA F1          : {m['f1_pa']:.4f}")
+        print(f"Dual-TH F1     : {diag['dual_f1']:.4f}")
+        print(f"High threshold : {diag['high']:.6f}")
+        print(f"Low threshold  : {diag['low']:.6f}")
+        print("Threshold sensitivity:")
+        for s in diag["sensitivity"]:
+            print(f"  high={s['high']:.6f}, low={s['low']:.6f}, dual_f1={s['dual_f1']:.4f}")
+        print("-" * 60)
 
-    if node_assign_acc:
-        node_usage = np.mean(np.stack(node_assign_acc, axis=0), axis=0)
-        node_entropy = -np.sum(node_usage * np.log(node_usage + 1e-10))
-        print("Node prototype usage:", np.array2string(node_usage, precision=4))
-        print(f"Node assignment entropy: {node_entropy:.6f}")
-    else:
-        print("Node prototype usage: unavailable")
+    export_latent_audit_outputs(
+        labels=labels,
+        dist_fused_to_proto=dist_fused_to_proto,
+        dist_corrected_to_proto=dist_corrected_to_proto,
+        correction_norm=correction_norm_list,
+        total_raw_score=total_raw_score_list,
+        total_corrected_score=total_corrected_score_list,
+    )
 
-    if patch_assign_acc:
-        patch_usage = np.mean(np.stack(patch_assign_acc, axis=0), axis=0)
-        patch_entropy = -np.sum(patch_usage * np.log(patch_usage + 1e-10))
-        print("Patch prototype usage:", np.array2string(patch_usage, precision=4))
-        print(f"Patch assignment entropy: {patch_entropy:.6f}")
-    else:
-        print("Patch prototype usage: unavailable")
+    if bool(anomaly_space_cfg.get("enable_memory_bank", True)) and bool(infer_cfg.get("save_anomaly_segments", True)):
+        memory_bank = AnomalyMemoryBank()
+        min_persistence = int(infer_cfg.get("min_anomaly_persistence", 3))
 
-    if bool(infer_cfg.get("save_anomaly_segments", True)):
-        all_segments = []
+        schema = SegmentEmbeddingSchema(
+            latent_dim=int(config.get("model", {}).get("hidden_dim", 64)),
+            num_node_prototypes=int(config.get("model", {}).get("prototype", {}).get("num_node_prototypes", 8)),
+            num_patch_prototypes=int(config.get("model", {}).get("prototype", {}).get("num_patch_prototypes", 8)),
+        )
+
+        corrected_high = corrected_diag["high"]
+        corrected_low = corrected_diag["low"]
+        hybrid_high = hybrid_diag["high"]
+        hybrid_low = hybrid_diag["low"]
+
+        segment_id_counter = 0
         for idx, seq in enumerate(test_dataset.get_full_sequences()):
             file_id = (
                 os.path.basename(test_dataset.file_paths[idx])
                 if hasattr(test_dataset, "file_paths") and idx < len(test_dataset.file_paths)
                 else f"test_seq_{idx}"
             )
-            rollout = online_rollout_sequence_with_branch(model, seq, config, branch="corrected")
-            segs = build_anomaly_segments(rollout["total_score"], corrected_high, corrected_low)
+            rollout = online_rollout_sequence(model, seq, config, reference_stats)
 
-            for seg in segs:
-                start_idx = seg["start_idx"]
-                end_idx = seg["end_idx"]
-                node_slice = [x for x in rollout["node_assign_hist"][start_idx : end_idx + 1] if x is not None]
-                patch_slice = [x for x in rollout["patch_assign_hist"][start_idx : end_idx + 1] if x is not None]
+            branch_to_segments = {
+                "corrected": build_anomaly_segments(
+                    rollout["corrected_score"], corrected_high, corrected_low, min_persistence=min_persistence
+                ),
+                "hybrid": build_anomaly_segments(
+                    rollout["hybrid_score"], hybrid_high, hybrid_low, min_persistence=min_persistence
+                ),
+            }
 
-                seg["file_id"] = file_id
-                seg["z_fused_mean"] = float(np.mean(rollout["z_fused_mean"][start_idx : end_idx + 1]))
-                seg["z_corrected_mean"] = float(np.mean(rollout["z_corrected_mean"][start_idx : end_idx + 1]))
-                seg["node_assign_hist"] = (
-                    np.mean(np.stack(node_slice, axis=0), axis=0).tolist() if node_slice else None
-                )
-                seg["patch_assign_hist"] = (
-                    np.mean(np.stack(patch_slice, axis=0), axis=0).tolist() if patch_slice else None
-                )
-                all_segments.append(seg)
+            for branch_name, segments in branch_to_segments.items():
+                score_key = f"{branch_name}_score"
+                for seg in segments:
+                    start_idx = seg["start_idx"]
+                    end_idx = seg["end_idx"]
+                    node_slice = [x for x in rollout["node_assign_hist"][start_idx : end_idx + 1] if x is not None]
+                    patch_slice = [x for x in rollout["patch_assign_hist"][start_idx : end_idx + 1] if x is not None]
 
-        export_anomaly_segments(config, all_segments)
+                    record = {
+                        "segment_id": int(segment_id_counter),
+                        "file_id": file_id,
+                        "start_idx": int(start_idx),
+                        "end_idx": int(end_idx),
+                        "length": int(seg["length"]),
+                        "peak_score": float(np.max(rollout[score_key][start_idx : end_idx + 1])),
+                        "mean_score": float(np.mean(rollout[score_key][start_idx : end_idx + 1])),
+                        "branch": branch_name,
+                        "z_fused_mean": np.mean(
+                            np.stack(rollout["z_fused_mean"][start_idx : end_idx + 1], axis=0), axis=0
+                        ).tolist(),
+                        "z_corrected_mean": np.mean(
+                            np.stack(rollout["z_corrected_mean"][start_idx : end_idx + 1], axis=0), axis=0
+                        ).tolist(),
+                        "node_assign_hist": (
+                            np.mean(np.stack(node_slice, axis=0), axis=0).tolist() if node_slice else None
+                        ),
+                        "patch_assign_hist": (
+                            np.mean(np.stack(patch_slice, axis=0), axis=0).tolist() if patch_slice else None
+                        ),
+                        "node_delta_mean": float(np.mean(rollout["node_delta_mean"][start_idx : end_idx + 1])),
+                        "patch_delta_mean": float(np.mean(rollout["patch_delta_mean"][start_idx : end_idx + 1])),
+                        "correction_norm_mean": float(np.mean(rollout["correction_norm"][start_idx : end_idx + 1])),
+                    }
+                    memory_bank.append_segment(record, schema=schema)
+                    segment_id_counter += 1
+
+        cluster_anomaly_segments(
+            memory_bank,
+            method=anomaly_space_cfg.get("clustering_method", "agglomerative"),
+            num_clusters=int(anomaly_space_cfg.get("num_anomaly_clusters", 8)),
+            unknown_similarity_threshold=float(anomaly_space_cfg.get("unknown_similarity_threshold", 0.55)),
+        )
+        export_memory_outputs(config, memory_bank)
 
 
 def load_labels(config):
