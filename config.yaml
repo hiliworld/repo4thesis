@@ -1,46 +1,38 @@
-# ==========================================
-# 🎛️ 智能配置 (Smart Config) - 修复版
-# ==========================================
-
 dataset:
-  name: "SMD"       # 名字改成 SMD 比较直观
+  name: "SMD"
   train_file: "./data/ServerMachineDataset/train/"
   test_file: "./data/ServerMachineDataset/test/"
-  
-  # 【关键修改】必须改成 metric，因为 SMD 是指标数据
   modality: "metric"
 
   format:
-    header: null       
-    sep: ","          
-    label_col: null    
+    header: null
+    sep: ","
+    label_col: null
     pattern: "*.txt"
 
-  # === 自动清洗 ===
   cleaning:
-    auto_clean: true        
-    drop_constant: true     
-    drop_high_nan: 0.5      
-    fill_nan: "linear"      
+    auto_clean: true
+    drop_constant: true
+    drop_high_nan: 0.5
+    fill_nan: "linear"
 
-  # 预处理
   window_size: 100
   normalization: "minmax"
-  
-  # 下面这些 Log 配置在 metric 模式下会被忽略，留着没事
-  vocab_size: 397     
-  embedding_dim: 16   
+
+  vocab_size: 397
+  embedding_dim: 16
   max_len: 50
 
 model:
   hidden_dim: 64
   z_dim: 32
-  use_prototype_fusion: true
+  lnt_pool_bins: 1
+  use_prototype_fusion: true  # global switch for prototype fusion path
   prototype:
-    use_node_prototype: true
-    use_patch_prototype: true
-    use_node_correction: true
-    use_patch_correction: true
+    use_node_prototype: true  # enable node prototype matching path
+    use_patch_prototype: true  # enable patch prototype matching path
+    use_node_correction: true  # apply node correction into z_corrected
+    use_patch_correction: true  # apply patch correction into z_corrected
     use_global_prototype: true
     use_local_prototype: false
     num_node_prototypes: 8
@@ -52,6 +44,8 @@ model:
     lambda_node_proto_loss: 0.02
     lambda_patch_proto_loss: 0.02
     lambda_corr_loss: 0.005
+    lambda_node_balance: 0.001
+    lambda_patch_balance: 0.001
     patch_size: 10
     fusion_mode: "residual_add"
 
@@ -60,6 +54,12 @@ train:
   epochs: 70
   lr: 0.0005
   patience: 10
+  recon_mode: "full_window"
+  lambda_recon_last: 1.0
+  lambda_recon_full: 0.2
+  checkpoint_mode: "loss"
+  val_eval_interval: 5
+  val_subset_max_batches: 20
 
 inference:
   alpha_pred: 1.0
@@ -69,6 +69,19 @@ inference:
   low_percentile: 95.0
   use_isolation: true
   replacement_mix: 0.5
+  hybrid_w_corrected: 1.0
+  hybrid_w_corr_norm: 0.35
+  hybrid_w_branch_gap: 0.25
+  hybrid_w_proto_uncertainty: 0.20
+  hybrid_w_spike: 0.30
+  min_anomaly_persistence: 3
   save_anomaly_segments: true
   anomaly_segment_csv: "outputs/anomaly_segments.csv"
   anomaly_segment_pkl: "outputs/anomaly_segments.pkl"
+  anomaly_cluster_json: "outputs/anomaly_clusters.json"
+
+anomaly_space:
+  enable_memory_bank: true
+  clustering_method: "agglomerative"
+  num_anomaly_clusters: 8
+  unknown_similarity_threshold: 0.55
