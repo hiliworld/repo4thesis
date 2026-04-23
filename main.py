@@ -17,6 +17,7 @@ from src.data.loader import get_dataloaders
 from src.models.anomaly_memory import (
     AnomalyMemoryBank,
     SegmentEmbeddingSchema,
+    build_learnable_segment_repr,
     cluster_anomaly_segments,
 )
 from src.models.anomaly_model import MyFinalModel
@@ -90,6 +91,29 @@ def compute_score_components(outputs, x, alpha_pred=1.0, beta_recon=1.0):
         "prototype_uncertainty": prototype_uncertainty,
         "spike_score": spike_score,
     }
+
+
+def attach_window_repr_from_components(model, outputs, components):
+    """Attach score-aware window representation if learnable segment encoder is enabled."""
+    if getattr(model, "segment_encoder", None) is None:
+        return outputs
+    score_stats = torch.stack(
+        [
+            components["total_corrected_score"],
+            components["correction_norm"],
+            components["branch_gap"],
+            components["spike_score"],
+        ],
+        dim=-1,
+    )  # [B, 4]
+    outputs["score_stats"] = score_stats
+    outputs["window_repr"] = model.segment_encoder.encode_window(
+        z_local_slots=outputs["z_local_slots"],
+        z_global_slots=outputs["z_global_slots"],
+        z_corrected=outputs["z_corrected"],
+        score_stats=score_stats,
+    )
+    return outputs
 
 
 def _init_reference_buffer():
@@ -269,6 +293,7 @@ def online_rollout_sequence(model, sequence, config, ref_stats):
         "node_delta_mean": [],
         "patch_delta_mean": [],
         "correction_norm": [],
+        "window_repr_seq": [],
     }
 
     model.eval()
@@ -278,6 +303,7 @@ def online_rollout_sequence(model, sequence, config, ref_stats):
             x = torch.from_numpy(window).unsqueeze(0).to(DEVICE)
             outputs = model(x)
             comps = compute_score_components(outputs, x, alpha_pred=alpha_pred, beta_recon=beta_recon)
+            outputs = attach_window_repr_from_components(model, outputs, comps)
             zvars = compute_hybrid_score(comps, ref_stats, infer_cfg)
 
             out["raw_score"].append(float(comps["total_raw_score"].item()))
@@ -306,6 +332,9 @@ def online_rollout_sequence(model, sequence, config, ref_stats):
             out["patch_delta_mean"].append(float(patch_delta.mean().item()) if patch_delta is not None else 0.0)
 
             out["correction_norm"].append(float(comps["correction_norm"].item()))
+            out["window_repr_seq"].append(
+                outputs["window_repr"].squeeze(0).detach().cpu().numpy() if outputs.get("window_repr") is not None else None
+            )
 
     for k in ["raw_score", "corrected_score", "hybrid_score", "node_delta_mean", "patch_delta_mean", "correction_norm"]:
         out[k] = np.asarray(out[k], dtype=np.float32)
@@ -586,6 +615,7 @@ def train(args):
     checkpoint_mode = str(train_cfg.get("checkpoint_mode", "loss")).lower()
     val_eval_interval = int(train_cfg.get("val_eval_interval", 5))
     val_subset_max_batches = int(train_cfg.get("val_subset_max_batches", 20))
+    lambda_window_repr_cl = float(train_cfg.get("lambda_window_repr_cl", 0.05))
     if checkpoint_mode not in ("loss", "pa_f1", "auc"):
         checkpoint_mode = "loss"
 
@@ -630,9 +660,20 @@ def train(args):
             )
 
             noise = torch.randn_like(x) * 0.01
-            z1 = model.metric_encoder(x)
-            z2 = model.metric_encoder(x + noise)
-            l_cl = criterion_cl(z1.view(x.size(0), -1), z2.view(x.size(0), -1))
+            outputs_aug = model(x + noise)
+
+            z1 = outputs["z_local"].reshape(x.size(0), -1)
+            z2 = outputs_aug["z_local"].reshape(x.size(0), -1)
+            l_cl = criterion_cl(z1, z2)
+
+            comps_clean = compute_score_components(outputs, x)
+            outputs = attach_window_repr_from_components(model, outputs, comps_clean)
+            l_window_repr = torch.tensor(0.0, device=DEVICE)
+            if outputs.get("window_repr") is not None:
+                comps_aug = compute_score_components(outputs_aug, x + noise)
+                outputs_aug = attach_window_repr_from_components(model, outputs_aug, comps_aug)
+                if outputs_aug.get("window_repr") is not None:
+                    l_window_repr = torch.mean((outputs["window_repr"] - outputs_aug["window_repr"]) ** 2)
 
             l_node_proto = torch.tensor(0.0, device=DEVICE)
             node_proto_latent = outputs.get("node_proto_latent")
@@ -679,6 +720,7 @@ def train(args):
                 + lambda_corr_loss * l_corr
                 + lambda_node_balance * l_node_balance
                 + lambda_patch_balance * l_patch_balance
+                + lambda_window_repr_cl * l_window_repr
             )
 
             loss.backward()
@@ -738,6 +780,7 @@ def train(args):
         "recon_mode": active_recon_mode if "active_recon_mode" in locals() else configured_recon_mode,
         "lambda_recon_last": float(lambda_recon_last),
         "lambda_recon_full": float(lambda_recon_full),
+        "lambda_window_repr_cl": float(lambda_window_repr_cl),
         "best_loss": float(best_loss),
         "checkpoint_mode": checkpoint_mode,
         "val_eval_interval": int(val_eval_interval),
@@ -960,13 +1003,15 @@ def evaluate(args):
     )
 
     if bool(anomaly_space_cfg.get("enable_memory_bank", True)) and bool(infer_cfg.get("save_anomaly_segments", True)):
-        memory_bank = AnomalyMemoryBank()
+        segment_repr_mode = anomaly_space_cfg.get("segment_repr_mode", "static_concat")
+        memory_bank = AnomalyMemoryBank(segment_repr_mode=segment_repr_mode)
         min_persistence = int(infer_cfg.get("min_anomaly_persistence", 3))
 
         schema = SegmentEmbeddingSchema(
             latent_dim=int(config.get("model", {}).get("hidden_dim", 64)),
             num_node_prototypes=int(config.get("model", {}).get("prototype", {}).get("num_node_prototypes", 8)),
             num_patch_prototypes=int(config.get("model", {}).get("prototype", {}).get("num_patch_prototypes", 8)),
+            segment_repr_dim=int(anomaly_space_cfg.get("segment_repr_dim", 64)),
         )
 
         corrected_high = corrected_diag["high"]
@@ -1025,7 +1070,20 @@ def evaluate(args):
                         "patch_delta_mean": float(np.mean(rollout["patch_delta_mean"][start_idx : end_idx + 1])),
                         "correction_norm_mean": float(np.mean(rollout["correction_norm"][start_idx : end_idx + 1])),
                     }
-                    memory_bank.append_segment(record, schema=schema)
+                    window_repr_slice = [w for w in rollout["window_repr_seq"][start_idx : end_idx + 1] if w is not None]
+                    if window_repr_slice:
+                        window_seq = np.stack(window_repr_slice, axis=0)
+                        seg_repr = build_learnable_segment_repr(
+                            window_seq,
+                            repr_dim=int(anomaly_space_cfg.get("segment_repr_dim", 64)),
+                            pool_mode=anomaly_space_cfg.get("segment_pool_mode", "attentive"),
+                        )
+                        record["window_repr_seq"] = window_seq.tolist()
+                        record["segment_repr"] = seg_repr.tolist()
+                    else:
+                        record["window_repr_seq"] = None
+                        record["segment_repr"] = None
+                    memory_bank.append_segment(record, schema=schema, segment_repr_mode=segment_repr_mode)
                     segment_id_counter += 1
 
         cluster_anomaly_segments(
