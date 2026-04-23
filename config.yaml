@@ -27,12 +27,18 @@ model:
   hidden_dim: 64
   z_dim: 32
   lnt_pool_bins: 1
-  use_prototype_fusion: true  # global switch for prototype fusion path
+  backbone_version: "lnt_v2_slotwise"   # legacy / lnt_v2_slotwise
+  lnt_num_slots: 2
+  lnt_slot_agg: "gated_sum"             # gated_sum / flatten_linear
+  gat_mode: "slotwise_shared"           # legacy / slotwise_shared
+  local_global_fusion: "gated"          # sum / gated
+  return_slot_debug: true
+  use_prototype_fusion: true
   prototype:
-    use_node_prototype: true  # enable node prototype matching path
-    use_patch_prototype: true  # enable patch prototype matching path
-    use_node_correction: true  # apply node correction into z_corrected
-    use_patch_correction: true  # apply patch correction into z_corrected
+    use_node_prototype: true
+    use_patch_prototype: true
+    use_node_correction: true
+    use_patch_correction: true
     use_global_prototype: true
     use_local_prototype: false
     num_node_prototypes: 8
@@ -57,6 +63,7 @@ train:
   recon_mode: "full_window"
   lambda_recon_last: 1.0
   lambda_recon_full: 0.2
+  lambda_window_repr_cl: 0.05
   checkpoint_mode: "loss"
   val_eval_interval: 5
   val_subset_max_batches: 20
@@ -82,6 +89,10 @@ inference:
 
 anomaly_space:
   enable_memory_bank: true
+  use_learnable_segment_encoder: true
+  segment_repr_mode: "learnable"  # learnable / static_concat
+  segment_repr_dim: 64
+  segment_pool_mode: "attentive"
   clustering_method: "agglomerative"
   num_anomaly_clusters: 8
   unknown_similarity_threshold: 0.55

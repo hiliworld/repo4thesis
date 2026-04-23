@@ -13,6 +13,7 @@ class SegmentEmbeddingSchema:
     latent_dim: int
     num_node_prototypes: int
     num_patch_prototypes: int
+    segment_repr_dim: int = 64
 
 
 def _to_1d_array(value, default_len=1):
@@ -25,18 +26,7 @@ def _to_1d_array(value, default_len=1):
 
 
 def build_segment_embedding(segment_record: Dict, schema: Optional[SegmentEmbeddingSchema] = None) -> np.ndarray:
-    """
-    Build fixed-length segment embedding with robust fallback for missing fields.
-
-    segment_embedding = concat(
-      z_corrected_mean,
-      z_fused_mean,
-      score_stats,
-      node_assign_hist,
-      patch_assign_hist,
-      delta_stats
-    )
-    """
+    """Static concat fallback embedding."""
     if schema is None:
         zc = _to_1d_array(segment_record.get("z_corrected_mean"), default_len=1)
         zf = _to_1d_array(segment_record.get("z_fused_mean"), default_len=zc.size)
@@ -66,6 +56,38 @@ def build_segment_embedding(segment_record: Dict, schema: Optional[SegmentEmbedd
     )
 
     return np.concatenate([zc, zf, score_stats, nh, ph, delta_stats], axis=0).astype(np.float32)
+
+
+def build_learnable_segment_repr(window_repr_seq, repr_dim=64, pool_mode="attentive"):
+    """Numpy implementation for test-time fallback segment representation.
+
+    Args:
+        window_repr_seq: [L, E]
+        repr_dim: fallback output dim when empty
+        pool_mode: attentive / mean
+    Returns:
+        segment_repr: [E]
+    """
+    seq = np.asarray(window_repr_seq, dtype=np.float32)
+    if seq.ndim == 1:
+        seq = seq.reshape(1, -1)
+    if seq.size == 0:
+        return np.zeros((int(repr_dim),), dtype=np.float32)
+
+    mode = str(pool_mode or "attentive").lower()
+    if mode == "mean" or seq.shape[0] == 1:
+        vec = seq.mean(axis=0)
+        norm = np.linalg.norm(vec) + 1e-8
+        return (vec / norm).astype(np.float32)
+
+    q = seq.mean(axis=0, keepdims=True)  # [1, E]
+    logits = np.matmul(seq, q.T).reshape(-1)  # [L]
+    logits = logits - np.max(logits)
+    weights = np.exp(logits)
+    weights = weights / (np.sum(weights) + 1e-8)
+    vec = np.sum(seq * weights[:, None], axis=0)
+    norm = np.linalg.norm(vec) + 1e-8
+    return (vec / norm).astype(np.float32)
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -100,17 +122,35 @@ def retrieve_anomaly_pattern(segment_embedding, cluster_centers, unknown_similar
 
 
 class AnomalyMemoryBank:
-    def __init__(self):
+    def __init__(self, segment_repr_mode="static_concat"):
         self.records: List[Dict] = []
         self.cluster_metadata: List[Dict] = []
+        self.segment_repr_mode = str(segment_repr_mode or "static_concat").lower()
 
-    def append_segment(self, segment_record: Dict, schema: Optional[SegmentEmbeddingSchema] = None):
+    def append_segment(
+        self,
+        segment_record: Dict,
+        schema: Optional[SegmentEmbeddingSchema] = None,
+        segment_repr_mode: Optional[str] = None,
+    ):
         rec = dict(segment_record)
         rec.setdefault("cluster_id", -1)
         rec.setdefault("nearest_cluster_id", -1)
         rec.setdefault("nearest_similarity", 0.0)
         rec.setdefault("is_unknown", True)
-        rec["segment_embedding"] = build_segment_embedding(rec, schema=schema).tolist()
+
+        mode = str(segment_repr_mode or self.segment_repr_mode).lower()
+        rec["segment_repr_mode"] = mode
+
+        use_learnable = mode == "learnable" and rec.get("segment_repr") is not None
+        if use_learnable:
+            rec["segment_embedding"] = _to_1d_array(
+                rec.get("segment_repr"),
+                default_len=(schema.segment_repr_dim if schema else 64),
+            ).tolist()
+        else:
+            rec["segment_embedding"] = build_segment_embedding(rec, schema=schema).tolist()
+
         self.records.append(rec)
 
     def get_embeddings_matrix(self) -> np.ndarray:
@@ -123,13 +163,20 @@ class AnomalyMemoryBank:
 
     def save_pkl(self, path: str):
         with open(path, "wb") as f:
-            pickle.dump({"records": self.records, "cluster_metadata": self.cluster_metadata}, f)
+            pickle.dump(
+                {
+                    "records": self.records,
+                    "cluster_metadata": self.cluster_metadata,
+                    "segment_repr_mode": self.segment_repr_mode,
+                },
+                f,
+            )
 
     @classmethod
     def load_pkl(cls, path: str):
         with open(path, "rb") as f:
             obj = pickle.load(f)
-        bank = cls()
+        bank = cls(segment_repr_mode=obj.get("segment_repr_mode", "static_concat"))
         bank.records = obj.get("records", [])
         bank.cluster_metadata = obj.get("cluster_metadata", [])
         return bank
@@ -138,7 +185,15 @@ class AnomalyMemoryBank:
         csv_rows = []
         for r in self.records:
             row = dict(r)
-            for key in ["z_fused_mean", "z_corrected_mean", "node_assign_hist", "patch_assign_hist", "segment_embedding"]:
+            for key in [
+                "z_fused_mean",
+                "z_corrected_mean",
+                "node_assign_hist",
+                "patch_assign_hist",
+                "window_repr_seq",
+                "segment_repr",
+                "segment_embedding",
+            ]:
                 if isinstance(row.get(key), (list, tuple)):
                     row[key] = json.dumps(row[key])
             csv_rows.append(row)
@@ -155,7 +210,6 @@ def cluster_anomaly_segments(memory_bank: AnomalyMemoryBank, method="agglomerati
     method = (method or "agglomerative").lower()
     n_clusters = int(max(1, min(num_clusters, n_segments)))
 
-    labels = None
     if method == "kmeans":
         labels = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit_predict(embeddings)
     elif method == "hdbscan":
