@@ -124,6 +124,25 @@ class PrototypeFusionModule(nn.Module):
             fusion_mode=fusion_mode,
         )
 
+    def get_node_prototypes(self):
+        if self.node_bank is None:
+            return None
+        return self.node_bank.prototypes
+
+    def match_to_node_prototypes(self, z: torch.Tensor):
+        """Readonly helper for evaluation audit.
+
+        Args:
+            z: [B, Q, D]
+        Returns:
+            z_proto: [B, Q, D] | None
+            assign: [B, Q, K] | None
+            delta: [B, Q, D] | None
+        """
+        if self.node_bank is None:
+            return None, None, None
+        return self.node_bank.matcher(z, self.node_bank.prototypes)
+
     def forward(self, x: torch.Tensor, z_fused: torch.Tensor):
         batch_size, num_nodes, latent_dim = z_fused.shape
 

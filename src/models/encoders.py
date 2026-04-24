@@ -135,10 +135,20 @@ class LNTMultiSlotEncoder(nn.Module):
         z_local_slots: [B, N, S, D]
     """
 
-    def __init__(self, input_dim=1, z_dim=64, kernel_sizes=None, head_channels=8, dropout=0.1, num_slots=2):
+    def __init__(
+        self,
+        input_dim=1,
+        z_dim=64,
+        kernel_sizes=None,
+        head_channels=8,
+        dropout=0.1,
+        num_slots=2,
+        use_slot_pos_embedding=True,
+    ):
         super().__init__()
         kernel_sizes = kernel_sizes or [3, 5, 9, 17]
         self.num_slots = max(1, int(num_slots))
+        self.use_slot_pos_embedding = bool(use_slot_pos_embedding)
 
         self.heads = nn.ModuleList(
             [
@@ -158,6 +168,9 @@ class LNTMultiSlotEncoder(nn.Module):
         )
         self.slot_pool = nn.AdaptiveAvgPool1d(self.num_slots)
         self.norm = nn.LayerNorm(z_dim)
+        # slot_embedding: [1, 1, S, D]
+        self.slot_embedding = nn.Parameter(torch.zeros(1, 1, self.num_slots, z_dim))
+        nn.init.normal_(self.slot_embedding, mean=0.0, std=0.02)
 
     def forward(self, x):
         # x: [B, T, N]
@@ -172,5 +185,7 @@ class LNTMultiSlotEncoder(nn.Module):
 
         # [B*N, D, S] -> [B, N, S, D]
         z_local_slots = pooled.permute(0, 2, 1).contiguous().view(bsz, num_nodes, self.num_slots, -1)
+        if self.use_slot_pos_embedding:
+            z_local_slots = z_local_slots + self.slot_embedding
         z_local_slots = self.norm(z_local_slots)
         return z_local_slots

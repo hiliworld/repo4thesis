@@ -40,6 +40,7 @@ class MyFinalModel(nn.Module):
         self.gat_mode = str(model_cfg.get("gat_mode", "legacy")).lower()
         self.local_global_fusion = str(model_cfg.get("local_global_fusion", "sum")).lower()
         self.return_slot_debug = bool(model_cfg.get("return_slot_debug", False))
+        self.use_slot_pos_embedding = bool(model_cfg.get("use_slot_pos_embedding", True))
 
         prototype_cfg = model_cfg.get("prototype", {})
         self.use_prototype_fusion = bool(model_cfg.get("use_prototype_fusion", False))
@@ -49,6 +50,7 @@ class MyFinalModel(nn.Module):
                 input_dim=1,
                 z_dim=self.hidden_dim,
                 num_slots=self.lnt_num_slots,
+                use_slot_pos_embedding=self.use_slot_pos_embedding,
             )
             self.metric_encoder = None
             self.local_slot_aggregator = SlotAggregator(

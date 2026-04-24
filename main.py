@@ -479,19 +479,38 @@ def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, a
     if len(audit_buffers["patch_usage"]) > 0:
         patch_usage = np.mean(np.stack(audit_buffers["patch_usage"], axis=0), axis=0).tolist()
 
+    patch_disabled = not bool(proto_cfg.get("use_patch_prototype", True))
+
     summary = {
         "switches": switches,
         "means": {
             "node_delta_norm": float(np.mean(audit_buffers["node_delta_norm"])) if audit_buffers["node_delta_norm"] else 0.0,
-            "patch_delta_norm": float(np.mean(audit_buffers["patch_delta_norm"])) if audit_buffers["patch_delta_norm"] else 0.0,
+            "patch_delta_norm": (None if patch_disabled else float(np.mean(audit_buffers["patch_delta_norm"])))
+            if audit_buffers["patch_delta_norm"]
+            else (None if patch_disabled else 0.0),
             "correction_norm": float(np.mean(audit_buffers["correction_norm"])) if audit_buffers["correction_norm"] else 0.0,
             "node_assignment_entropy": float(np.mean(audit_buffers["node_entropy"])) if audit_buffers["node_entropy"] else 0.0,
-            "patch_assignment_entropy": float(np.mean(audit_buffers["patch_entropy"])) if audit_buffers["patch_entropy"] else 0.0,
+            "patch_assignment_entropy": (None if patch_disabled else float(np.mean(audit_buffers["patch_entropy"])))
+            if audit_buffers["patch_entropy"]
+            else (None if patch_disabled else 0.0),
         },
+        "node_delta_norm_mean": float(np.mean(audit_buffers["node_delta_norm"])) if audit_buffers["node_delta_norm"] else 0.0,
+        "patch_delta_norm_mean": (None if patch_disabled else float(np.mean(audit_buffers["patch_delta_norm"])))
+        if audit_buffers["patch_delta_norm"]
+        else (None if patch_disabled else 0.0),
+        "correction_norm_mean": float(np.mean(audit_buffers["correction_norm"])) if audit_buffers["correction_norm"] else 0.0,
+        "node_assignment_entropy": float(np.mean(audit_buffers["node_entropy"])) if audit_buffers["node_entropy"] else 0.0,
+        "patch_assignment_entropy": (None if patch_disabled else float(np.mean(audit_buffers["patch_entropy"])))
+        if audit_buffers["patch_entropy"]
+        else (None if patch_disabled else 0.0),
+        "patch_path_status": "disabled" if patch_disabled else "enabled",
         "usage_frequency": {
             "node_prototype_usage": node_usage,
-            "patch_prototype_usage": patch_usage,
+            "patch_prototype_usage": None if patch_disabled else patch_usage,
         },
+        "node_prototype_usage": node_usage,
+        "patch_prototype_usage": [] if patch_disabled else (patch_usage or []),
+        "slot_level_audit": audit_buffers.get("slot_level", {}),
         "branch_results": {
             "raw": {
                 "auc": float(raw_diag["metrics"]["auc"]),
@@ -525,6 +544,105 @@ def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, a
     print(f"Saved prototype path audit json: {audit_path}")
 
 
+def _slot_entropy(slot_weights):
+    if slot_weights is None:
+        return None
+    w = np.asarray(slot_weights, dtype=np.float32)
+    if w.size == 0:
+        return None
+    w = np.clip(w, 1e-8, 1.0)
+    entropy = -(w * np.log(w)).sum(axis=2)
+    return float(np.mean(entropy))
+
+
+def _slot_diff(slots):
+    if slots is None:
+        return None
+    arr = np.asarray(slots, dtype=np.float32)
+    if arr.ndim != 4 or arr.shape[2] < 2:
+        return 0.0
+    s = arr.shape[2]
+    if s == 2:
+        diff = np.linalg.norm(arr[:, :, 0, :] - arr[:, :, 1, :], axis=-1)
+        return float(np.mean(diff))
+    pair_diffs = []
+    for i in range(s):
+        for j in range(i + 1, s):
+            pair_diffs.append(np.linalg.norm(arr[:, :, i, :] - arr[:, :, j, :], axis=-1))
+    if not pair_diffs:
+        return 0.0
+    return float(np.mean(np.stack(pair_diffs, axis=0)))
+
+
+def export_slot_gate_audit(config, slot_gate_buffers, labels=None):
+    os.makedirs("outputs", exist_ok=True)
+    audit_path = "outputs/slot_gate_audit.json"
+    model_cfg = config.get("model", {})
+    if not bool(model_cfg.get("return_slot_debug", False)):
+        with open(audit_path, "w", encoding="utf-8") as f:
+            json.dump({"warning": "return_slot_debug=false, slot/gate audit skipped."}, f, ensure_ascii=False, indent=2)
+        print(f"Saved slot gate audit json: {audit_path}")
+        return
+
+    local_w = slot_gate_buffers.get("local_slot_weights")
+    global_w = slot_gate_buffers.get("global_slot_weights")
+    local_slots = slot_gate_buffers.get("z_local_slots")
+    global_slots = slot_gate_buffers.get("z_global_slots")
+    gate_vals = slot_gate_buffers.get("local_global_gate")
+
+    summary = {
+        "local_slot_weight_mean": float(np.mean(local_w)) if local_w is not None else None,
+        "local_slot_weight_std": float(np.std(local_w)) if local_w is not None else None,
+        "global_slot_weight_mean": float(np.mean(global_w)) if global_w is not None else None,
+        "global_slot_weight_std": float(np.std(global_w)) if global_w is not None else None,
+        "local_slot_entropy_mean": _slot_entropy(local_w),
+        "global_slot_entropy_mean": _slot_entropy(global_w),
+        "local_global_gate_mean": float(np.mean(gate_vals)) if gate_vals is not None else None,
+        "local_global_gate_std": float(np.std(gate_vals)) if gate_vals is not None else None,
+        "global_slot_diff_mean": _slot_diff(global_slots),
+        "local_slot_diff_mean": _slot_diff(local_slots),
+    }
+
+    if labels is not None:
+        total = labels.shape[0]
+        if local_w is not None and local_w.shape[0] == total:
+            normal_mask = labels == 0
+            anomaly_mask = labels == 1
+            summary["normal_local_slot_weight_mean"] = float(np.mean(local_w[normal_mask])) if np.any(normal_mask) else None
+            summary["anomaly_local_slot_weight_mean"] = (
+                float(np.mean(local_w[anomaly_mask])) if np.any(anomaly_mask) else None
+            )
+        if global_w is not None and global_w.shape[0] == total:
+            normal_mask = labels == 0
+            anomaly_mask = labels == 1
+            summary["normal_global_slot_weight_mean"] = (
+                float(np.mean(global_w[normal_mask])) if np.any(normal_mask) else None
+            )
+            summary["anomaly_global_slot_weight_mean"] = (
+                float(np.mean(global_w[anomaly_mask])) if np.any(anomaly_mask) else None
+            )
+        if gate_vals is not None and gate_vals.shape[0] == total:
+            normal_mask = labels == 0
+            anomaly_mask = labels == 1
+            summary["normal_local_global_gate_mean"] = (
+                float(np.mean(gate_vals[normal_mask])) if np.any(normal_mask) else None
+            )
+            summary["anomaly_local_global_gate_mean"] = (
+                float(np.mean(gate_vals[anomaly_mask])) if np.any(anomaly_mask) else None
+            )
+        if global_slots is not None and global_slots.shape[0] == total:
+            normal_mask = labels == 0
+            anomaly_mask = labels == 1
+            summary["normal_global_slot_diff_mean"] = _slot_diff(global_slots[normal_mask]) if np.any(normal_mask) else None
+            summary["anomaly_global_slot_diff_mean"] = (
+                _slot_diff(global_slots[anomaly_mask]) if np.any(anomaly_mask) else None
+            )
+
+    with open(audit_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"Saved slot gate audit json: {audit_path}")
+
+
 def compute_recon_loss(recon, x, criterion_mse, train_cfg):
     recon_mode = str(train_cfg.get("recon_mode", "full_window")).lower()
     lambda_recon_last = float(train_cfg.get("lambda_recon_last", 1.0))
@@ -541,6 +659,34 @@ def compute_recon_loss(recon, x, criterion_mse, train_cfg):
         l_recon = criterion_mse(recon, x)
 
     return l_recon, recon_mode, lambda_recon_last, lambda_recon_full
+
+
+def compute_slot_proto_stats(prototype_fusion, z_slots_np, labels=None):
+    if prototype_fusion is None or z_slots_np is None:
+        return {}
+    if not hasattr(prototype_fusion, "match_to_node_prototypes"):
+        return {}
+
+    with torch.no_grad():
+        z_slots = torch.from_numpy(z_slots_np).to(DEVICE)
+        b, n, s, d = z_slots.shape
+        z_flat = z_slots.reshape(b, n * s, d)
+        _, assign, delta = prototype_fusion.match_to_node_prototypes(z_flat)
+        if assign is None or delta is None:
+            return {}
+        dist = torch.norm(delta, p=2, dim=-1).reshape(b, n, s).mean(dim=(1, 2)).detach().cpu().numpy()
+        entropy = (-(assign * torch.log(assign + 1e-8)).sum(dim=-1)).reshape(b, n, s).mean(dim=(1, 2)).detach().cpu().numpy()
+
+    out = {
+        "distance_mean": float(np.mean(dist)),
+        "entropy_mean": float(np.mean(entropy)),
+    }
+    if labels is not None and len(labels) == len(dist):
+        normal_mask = labels == 0
+        anomaly_mask = labels == 1
+        out["normal_distance_mean"] = float(np.mean(dist[normal_mask])) if np.any(normal_mask) else None
+        out["anomaly_distance_mean"] = float(np.mean(dist[anomaly_mask])) if np.any(anomaly_mask) else None
+    return out
 
 
 def evaluate_subset_for_checkpoint(model, test_loader, labels, config, max_batches=20):
@@ -855,6 +1001,14 @@ def evaluate(args):
         "patch_usage": [],
         "node_entropy": [],
         "patch_entropy": [],
+        "slot_level": {},
+    }
+    slot_gate_buffers = {
+        "local_slot_weights": [],
+        "global_slot_weights": [],
+        "z_local_slots": [],
+        "z_global_slots": [],
+        "local_global_gate": [],
     }
 
     print("Running Inference")
@@ -926,6 +1080,22 @@ def evaluate(args):
             else:
                 prototype_audit_buffers["patch_entropy"].append(0.0)
 
+            z_local_slots = outputs.get("z_local_slots")
+            if z_local_slots is not None:
+                slot_gate_buffers["z_local_slots"].append(z_local_slots.detach().cpu().numpy())
+            z_global_slots = outputs.get("z_global_slots")
+            if z_global_slots is not None:
+                slot_gate_buffers["z_global_slots"].append(z_global_slots.detach().cpu().numpy())
+            slot_w_local = outputs.get("slot_weights_local")
+            if slot_w_local is not None:
+                slot_gate_buffers["local_slot_weights"].append(slot_w_local.detach().cpu().numpy())
+            slot_w_global = outputs.get("slot_weights_global")
+            if slot_w_global is not None:
+                slot_gate_buffers["global_slot_weights"].append(slot_w_global.detach().cpu().numpy())
+            lg_gate = outputs.get("local_global_gate")
+            if lg_gate is not None:
+                slot_gate_buffers["local_global_gate"].append(lg_gate.detach().cpu().numpy())
+
     raw_scores = np.concatenate(raw_scores)
     corrected_scores = np.concatenate(corrected_scores)
     hybrid_scores = np.concatenate(hybrid_scores)
@@ -960,6 +1130,34 @@ def evaluate(args):
     correction_norm_list = correction_norm_list[:min_len]
     total_raw_score_list = total_raw_score_list[:min_len]
     total_corrected_score_list = total_corrected_score_list[:min_len]
+
+    for k in list(slot_gate_buffers.keys()):
+        if slot_gate_buffers[k]:
+            merged = np.concatenate(slot_gate_buffers[k], axis=0)
+            slot_gate_buffers[k] = merged[:min_len]
+        else:
+            slot_gate_buffers[k] = None
+
+    local_slot_stats = compute_slot_proto_stats(
+        model.prototype_fusion if hasattr(model, "prototype_fusion") else None,
+        slot_gate_buffers["z_local_slots"],
+        labels=labels,
+    )
+    global_slot_stats = compute_slot_proto_stats(
+        model.prototype_fusion if hasattr(model, "prototype_fusion") else None,
+        slot_gate_buffers["z_global_slots"],
+        labels=labels,
+    )
+    prototype_audit_buffers["slot_level"] = {
+        "local_slot_proto_distance_mean": local_slot_stats.get("distance_mean"),
+        "normal_local_slot_proto_distance_mean": local_slot_stats.get("normal_distance_mean"),
+        "anomaly_local_slot_proto_distance_mean": local_slot_stats.get("anomaly_distance_mean"),
+        "global_slot_proto_distance_mean": global_slot_stats.get("distance_mean"),
+        "normal_global_slot_proto_distance_mean": global_slot_stats.get("normal_distance_mean"),
+        "anomaly_global_slot_proto_distance_mean": global_slot_stats.get("anomaly_distance_mean"),
+        "local_slot_proto_entropy_mean": local_slot_stats.get("entropy_mean"),
+        "global_slot_proto_entropy_mean": global_slot_stats.get("entropy_mean"),
+    }
 
     raw_diag = branch_diagnostics(raw_scores, labels, raw_ref, infer_cfg)
     corrected_diag = branch_diagnostics(corrected_scores, labels, corrected_ref, infer_cfg)
@@ -1000,6 +1198,11 @@ def evaluate(args):
         corrected_diag=corrected_diag,
         hybrid_diag=hybrid_diag,
         audit_buffers=prototype_audit_buffers,
+    )
+    export_slot_gate_audit(
+        config=config,
+        slot_gate_buffers=slot_gate_buffers,
+        labels=labels,
     )
 
     if bool(anomaly_space_cfg.get("enable_memory_bank", True)) and bool(infer_cfg.get("save_anomaly_segments", True)):
