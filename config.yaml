@@ -33,12 +33,13 @@ model:
   gat_mode: "slotwise_shared"           # legacy / slotwise_shared
   local_global_fusion: "gated"          # sum / gated
   return_slot_debug: true
+  use_slot_pos_embedding: true
   use_prototype_fusion: true
   prototype:
     use_node_prototype: true
-    use_patch_prototype: true
+    use_patch_prototype: false
     use_node_correction: true
-    use_patch_correction: true
+    use_patch_correction: false
     use_global_prototype: true
     use_local_prototype: false
     num_node_prototypes: 8
@@ -60,11 +61,11 @@ train:
   epochs: 70
   lr: 0.0005
   patience: 10
-  recon_mode: "full_window"
+  recon_mode: "mixed"
   lambda_recon_last: 1.0
   lambda_recon_full: 0.2
-  lambda_window_repr_cl: 0.05
-  checkpoint_mode: "loss"
+  lambda_window_repr_cl: 0.0
+  checkpoint_mode: "pa_f1"
   val_eval_interval: 5
   val_subset_max_batches: 20
 
@@ -89,8 +90,8 @@ inference:
 
 anomaly_space:
   enable_memory_bank: true
-  use_learnable_segment_encoder: true
-  segment_repr_mode: "learnable"  # learnable / static_concat
+  use_learnable_segment_encoder: false
+  segment_repr_mode: "static_concat"  # learnable / static_concat
   segment_repr_dim: 64
   segment_pool_mode: "attentive"
   clustering_method: "agglomerative"
