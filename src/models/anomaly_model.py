@@ -43,6 +43,8 @@ class MyFinalModel(nn.Module):
         self.use_slot_pos_embedding = bool(model_cfg.get("use_slot_pos_embedding", True))
 
         prototype_cfg = model_cfg.get("prototype", {})
+        prototype_v2_cfg = config.get("prototype_v2", {})
+        correction_gate_cfg = prototype_v2_cfg.get("correction_gate", {})
         self.use_prototype_fusion = bool(model_cfg.get("use_prototype_fusion", False))
 
         if self.backbone_version == "lnt_v2_slotwise":
@@ -118,6 +120,11 @@ class MyFinalModel(nn.Module):
                 lambda_patch=prototype_cfg.get("lambda_patch", 0.3),
                 patch_size=prototype_cfg.get("patch_size", 10),
                 fusion_mode=prototype_cfg.get("fusion_mode", "residual_add"),
+                correction_gate_enable=bool(correction_gate_cfg.get("enable", False)),
+                correction_gate_mode=str(correction_gate_cfg.get("mode", "entropy")),
+                correction_gate_min=float(correction_gate_cfg.get("min_gate", 0.05)),
+                correction_gate_max=float(correction_gate_cfg.get("max_gate", 1.0)),
+                correction_gate_detach=bool(correction_gate_cfg.get("detach_gate", True)),
             )
 
         self.pred_head = nn.Sequential(nn.Linear(self.hidden_dim, 32), nn.ReLU(), nn.Linear(32, 1))
@@ -259,6 +266,14 @@ class MyFinalModel(nn.Module):
                 "patch_delta": proto_outputs["patch_delta"],
                 "patch_global_delta": proto_outputs["patch_global_delta"],
                 "z_patch": proto_outputs["z_patch"],
+                "node_assign_entropy": proto_outputs.get("node_assign_entropy"),
+                "node_assign_confidence": proto_outputs.get("node_assign_confidence"),
+                "node_correction_gate": proto_outputs.get("node_correction_gate"),
+                "node_min_proto_dist": proto_outputs.get("node_min_proto_dist"),
+                "prototype_pairwise_distance_mean": proto_outputs.get("prototype_pairwise_distance_mean"),
+                "prototype_pairwise_distance_min": proto_outputs.get("prototype_pairwise_distance_min"),
+                "prototype_pairwise_cosine_mean": proto_outputs.get("prototype_pairwise_cosine_mean"),
+                "prototype_pairwise_cosine_max": proto_outputs.get("prototype_pairwise_cosine_max"),
                 "score_stats": None,
                 "window_repr": None,
             }

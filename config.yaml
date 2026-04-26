@@ -69,6 +69,56 @@ train:
   val_eval_interval: 5
   val_subset_max_batches: 20
 
+prototype_v2:
+  enable: true
+  warmup:
+    enable: true
+    warmup_epochs: 10
+    use_raw_heads_during_warmup: true
+    disable_proto_losses_during_warmup: true
+  pseudo_split:
+    enable: true
+    score_source: "raw_pred_recon"
+    core_percentile: 95.0
+    tail_percentile: 99.0
+    gray_zone_enable: true
+    save_path: "outputs/prototype_v2_pseudo_split.json"
+  kmeans_init:
+    enable: true
+    init_after_warmup: true
+    latent_source: "z_fused"
+    max_samples: 50000
+    num_iters: 30
+    random_seed: 42
+    save_path: "outputs/prototype_v2_init_audit.json"
+  usage_floor:
+    enable: true
+    min_usage: 0.03
+    lambda_usage_floor: 0.001
+  repulsion:
+    enable: true
+    margin: 0.5
+    lambda_repulsion: 0.001
+    metric: "l2"
+  proto_nce:
+    enable: true
+    lambda_proto_nce: 0.005
+    tau: 0.1
+    use_stopgrad_assignment: true
+  correction_gate:
+    enable: true
+    mode: "entropy"
+    min_gate: 0.05
+    max_gate: 1.0
+    detach_gate: true
+  pseudo_tail:
+    enable_weak_repulsion: false
+    lambda_tail_repulsion: 0.001
+    margin: 0.5
+  audit:
+    save_pairwise_proto_stats: true
+    save_gate_stats: true
+
 inference:
   alpha_pred: 1.0
   beta_recon: 1.0
