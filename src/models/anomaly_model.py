@@ -125,6 +125,9 @@ class MyFinalModel(nn.Module):
                 correction_gate_min=float(correction_gate_cfg.get("min_gate", 0.05)),
                 correction_gate_max=float(correction_gate_cfg.get("max_gate", 1.0)),
                 correction_gate_detach=bool(correction_gate_cfg.get("detach_gate", True)),
+                correction_gate_radius_factor=float(correction_gate_cfg.get("radius_factor", 1.5)),
+                correction_gate_radius_temperature=float(correction_gate_cfg.get("radius_temperature", 0.2)),
+                correction_gate_eps=float(correction_gate_cfg.get("eps", 1.0e-8)),
             )
 
         self.pred_head = nn.Sequential(nn.Linear(self.hidden_dim, 32), nn.ReLU(), nn.Linear(32, 1))
@@ -269,6 +272,10 @@ class MyFinalModel(nn.Module):
                 "node_assign_entropy": proto_outputs.get("node_assign_entropy"),
                 "node_assign_confidence": proto_outputs.get("node_assign_confidence"),
                 "node_correction_gate": proto_outputs.get("node_correction_gate"),
+                "node_entropy_gate": proto_outputs.get("node_entropy_gate"),
+                "node_radius_gate": proto_outputs.get("node_radius_gate"),
+                "node_top1_proto_dist": proto_outputs.get("node_top1_proto_dist"),
+                "node_top1_proto_radius": proto_outputs.get("node_top1_proto_radius"),
                 "node_min_proto_dist": proto_outputs.get("node_min_proto_dist"),
                 "prototype_pairwise_distance_mean": proto_outputs.get("prototype_pairwise_distance_mean"),
                 "prototype_pairwise_distance_min": proto_outputs.get("prototype_pairwise_distance_min"),

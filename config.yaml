@@ -46,7 +46,7 @@ model:
     num_patch_prototypes: 8
     tau_node: 0.1
     tau_patch: 0.1
-    lambda_node: 0.5
+    lambda_node: 0.2
     lambda_patch: 0.3
     lambda_node_proto_loss: 0.02
     lambda_patch_proto_loss: 0.02
@@ -73,7 +73,7 @@ prototype_v2:
   enable: true
   warmup:
     enable: true
-    warmup_epochs: 10
+    warmup_epochs: 20
     use_raw_heads_during_warmup: true
     disable_proto_losses_during_warmup: true
   pseudo_split:
@@ -107,10 +107,17 @@ prototype_v2:
     use_stopgrad_assignment: true
   correction_gate:
     enable: true
-    mode: "entropy"
-    min_gate: 0.05
-    max_gate: 1.0
+    mode: "entropy_radius"
+    min_gate: 0.0
+    max_gate: 0.5
     detach_gate: true
+    radius_factor: 1.5
+    radius_temperature: 0.2
+    eps: 1.0e-8
+  checkpoint:
+    reset_best_after_kmeans: true
+    save_best_prototype_v2: true
+    prototype_v2_checkpoint_name: "best_model_prototype_v2.pth"
   pseudo_tail:
     enable_weak_repulsion: false
     lambda_tail_repulsion: 0.001
