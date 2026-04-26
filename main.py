@@ -552,10 +552,25 @@ def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, a
             "usage_floor_loss": None,
             "prototype_repulsion_loss": None,
             "proto_nce_loss": None,
+            "correction_gate_mode": None,
+            "correction_gate_min": None,
+            "correction_gate_max": None,
+            "radius_factor": None,
+            "radius_temperature": None,
             "correction_gate_mean": None,
             "correction_gate_std": None,
+            "entropy_gate_mean": None,
+            "entropy_gate_std": None,
+            "radius_gate_mean": None,
+            "radius_gate_std": None,
             "normal_correction_gate_mean": None,
             "anomaly_correction_gate_mean": None,
+            "normal_radius_gate_mean": None,
+            "anomaly_radius_gate_mean": None,
+            "normal_top1_proto_dist_mean": None,
+            "anomaly_top1_proto_dist_mean": None,
+            "normal_top1_proto_radius_mean": None,
+            "anomaly_top1_proto_radius_mean": None,
             "prototype_pairwise_distance_mean": None,
             "prototype_pairwise_distance_min": None,
             "prototype_pairwise_cosine_mean": None,
@@ -835,6 +850,7 @@ def train(args):
     repulsion_cfg = prototype_v2_cfg.get("repulsion", {})
     proto_nce_cfg = prototype_v2_cfg.get("proto_nce", {})
     pseudo_tail_cfg = prototype_v2_cfg.get("pseudo_tail", {})
+    p2_checkpoint_cfg = prototype_v2_cfg.get("checkpoint", {})
 
     lambda_node_proto_loss = float(proto_cfg.get("lambda_node_proto_loss", 0.02))
     lambda_patch_proto_loss = float(proto_cfg.get("lambda_patch_proto_loss", 0.02))
@@ -865,6 +881,9 @@ def train(args):
     best_loss = float("inf")
     patience_counter = 0
     save_path = "best_model.pth"
+    warmup_best_path = "best_model_warmup.pth"
+    prototype_v2_best_path = str(p2_checkpoint_cfg.get("prototype_v2_checkpoint_name", "best_model_prototype_v2.pth"))
+    last_model_path = "last_model.pth"
     train_cfg = config.get("train", {})
     configured_recon_mode = str(train_cfg.get("recon_mode", "full_window")).lower()
     lambda_recon_last = float(train_cfg.get("lambda_recon_last", 1.0))
@@ -885,6 +904,11 @@ def train(args):
     best_auc_path = "best_model_auc.pth"
     best_pa_f1 = -1.0
     best_auc = -1.0
+    best_metric_name = "loss"
+    kmeans_reset_done = False
+
+    if p2_enable and warmup_epochs > 0 and epochs <= warmup_epochs:
+        print("Warning: epochs <= warmup_epochs, Prototype-v2 initialization will not run.")
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -1032,7 +1056,31 @@ def train(args):
 
         avg_loss = epoch_loss / len(train_loader)
         cost = time.time() - start
-        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f} | Time: {cost:.1f}s")
+        gate_mean = None
+        entropy_gate_mean = None
+        radius_gate_mean = None
+        if "outputs" in locals() and isinstance(outputs, dict):
+            node_gate_t = outputs.get("node_correction_gate")
+            entropy_gate_t = outputs.get("node_entropy_gate")
+            radius_gate_t = outputs.get("node_radius_gate")
+            if node_gate_t is not None:
+                gate_mean = float(node_gate_t.detach().mean().item())
+            if entropy_gate_t is not None:
+                entropy_gate_mean = float(entropy_gate_t.detach().mean().item())
+            if radius_gate_t is not None:
+                radius_gate_mean = float(radius_gate_t.detach().mean().item())
+        checkpoint_stage = "prototype_v2" if p2_state["kmeans_initialized"] else "warmup"
+        print(
+            f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f} | Time: {cost:.1f}s | "
+            f"is_warmup={is_warmup} | kmeans_initialized={p2_state['kmeans_initialized']} | checkpoint_stage={checkpoint_stage}"
+        )
+        if gate_mean is not None:
+            entropy_gate_mean_val = 0.0 if entropy_gate_mean is None else entropy_gate_mean
+            radius_gate_mean_val = 0.0 if radius_gate_mean is None else radius_gate_mean
+            print(
+                f"Gate stats | correction_gate_mean={gate_mean:.4f} | "
+                f"entropy_gate_mean={entropy_gate_mean_val:.4f} | radius_gate_mean={radius_gate_mean_val:.4f}"
+            )
 
         if p2_enable and (not p2_state["kmeans_initialized"]) and (epoch + 1) == warmup_epochs and bool(pseudo_split_cfg.get("enable", True)):
             scores, z_fused_windows = collect_train_scores_and_latents(model, train_loader, DEVICE, config)
@@ -1118,19 +1166,29 @@ def train(args):
                         ensure_ascii=False,
                         indent=2,
                     )
+                if bool(p2_checkpoint_cfg.get("reset_best_after_kmeans", True)):
+                    best_loss = float("inf")
+                    best_pa_f1 = -1.0
+                    best_auc = -1.0
+                    patience_counter = 0
+                    kmeans_reset_done = True
+                    print(
+                        "Prototype-v2 initialized. Resetting best metric and patience for prototype-v2 fine-tuning stage."
+                    )
             model.train()
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-            torch.save(model.state_dict(), best_loss_path)
-            print(f"Saved Best Model ({avg_loss:.4f})")
+        current_metric = None
+        if checkpoint_mode == "loss":
+            current_metric = avg_loss
+            best_metric_name = "loss"
+            metric_improved = current_metric < best_loss
+            if metric_improved:
+                best_loss = current_metric
+        elif checkpoint_mode == "pa_f1":
+            best_metric_name = "pa_f1"
+            metric_improved = False
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print("Early Stopping Triggered")
-                break
+            best_metric_name = "auc"
+            metric_improved = False
 
         if val_eval_interval > 0 and ((epoch + 1) % val_eval_interval == 0):
             val_metrics = evaluate_subset_for_checkpoint(
@@ -1147,10 +1205,49 @@ def train(args):
                 if current_pa_f1 > best_pa_f1:
                     best_pa_f1 = current_pa_f1
                     torch.save(model.state_dict(), best_pa_f1_path)
+                    if checkpoint_mode == "pa_f1":
+                        metric_improved = True
+                        current_metric = current_pa_f1
                 if current_auc > best_auc:
                     best_auc = current_auc
                     torch.save(model.state_dict(), best_auc_path)
+                    if checkpoint_mode == "auc":
+                        metric_improved = True
+                        current_metric = current_auc
             model.train()
+
+        if checkpoint_mode in ("pa_f1", "auc") and current_metric is None:
+            current_metric = best_pa_f1 if checkpoint_mode == "pa_f1" else best_auc
+
+        if metric_improved:
+            patience_counter = 0
+            torch.save(model.state_dict(), save_path)
+            if checkpoint_mode == "loss":
+                torch.save(model.state_dict(), best_loss_path)
+            if checkpoint_mode == "pa_f1":
+                torch.save(model.state_dict(), best_pa_f1_path)
+            if checkpoint_mode == "auc":
+                torch.save(model.state_dict(), best_auc_path)
+
+            if checkpoint_stage == "warmup":
+                torch.save(model.state_dict(), warmup_best_path)
+            elif bool(p2_checkpoint_cfg.get("save_best_prototype_v2", True)):
+                torch.save(model.state_dict(), prototype_v2_best_path)
+                print(f"Saved best prototype-v2 checkpoint: {prototype_v2_best_path}")
+            print(f"Saved Best Model ({best_metric_name}={current_metric:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early Stopping Triggered")
+                torch.save(model.state_dict(), last_model_path)
+                break
+
+        torch.save(model.state_dict(), last_model_path)
+        print(
+            f"Early-stop metric: {best_metric_name}={current_metric:.4f} | "
+            f"patience_counter={patience_counter}/{patience} | "
+            f"saved_prototype_v2_best={checkpoint_stage == 'prototype_v2' and metric_improved}"
+        )
 
     print(f"Training Complete. Model saved to {save_path}")
     source_checkpoint = best_loss_path
@@ -1176,6 +1273,10 @@ def train(args):
         "val_subset_max_batches": int(val_subset_max_batches),
         "best_pa_f1": None if best_pa_f1 < 0 else float(best_pa_f1),
         "best_auc": None if best_auc < 0 else float(best_auc),
+        "warmup_best_path": warmup_best_path,
+        "prototype_v2_best_path": prototype_v2_best_path,
+        "last_model_path": last_model_path,
+        "kmeans_reset_done": bool(kmeans_reset_done),
         "prototype_v2": p2_state,
     }
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -1246,6 +1347,10 @@ def evaluate(args):
         "node_entropy": [],
         "patch_entropy": [],
         "node_gate": [],
+        "node_entropy_gate": [],
+        "node_radius_gate": [],
+        "node_top1_proto_dist": [],
+        "node_top1_proto_radius": [],
         "node_pairwise_distance_mean": [],
         "node_pairwise_distance_min": [],
         "node_pairwise_cosine_mean": [],
@@ -1332,6 +1437,18 @@ def evaluate(args):
             node_gate = outputs.get("node_correction_gate")
             if node_gate is not None:
                 prototype_audit_buffers["node_gate"].append(node_gate.detach().cpu().numpy())
+            node_entropy_gate = outputs.get("node_entropy_gate")
+            if node_entropy_gate is not None:
+                prototype_audit_buffers["node_entropy_gate"].append(node_entropy_gate.detach().cpu().numpy())
+            node_radius_gate = outputs.get("node_radius_gate")
+            if node_radius_gate is not None:
+                prototype_audit_buffers["node_radius_gate"].append(node_radius_gate.detach().cpu().numpy())
+            node_top1_proto_dist = outputs.get("node_top1_proto_dist")
+            if node_top1_proto_dist is not None:
+                prototype_audit_buffers["node_top1_proto_dist"].append(node_top1_proto_dist.detach().cpu().numpy())
+            node_top1_proto_radius = outputs.get("node_top1_proto_radius")
+            if node_top1_proto_radius is not None:
+                prototype_audit_buffers["node_top1_proto_radius"].append(node_top1_proto_radius.detach().cpu().numpy())
             if outputs.get("prototype_pairwise_distance_mean") is not None:
                 prototype_audit_buffers["node_pairwise_distance_mean"].append(float(outputs["prototype_pairwise_distance_mean"]))
                 prototype_audit_buffers["node_pairwise_distance_min"].append(float(outputs["prototype_pairwise_distance_min"]))
@@ -1436,16 +1553,51 @@ def evaluate(args):
     gate_arr = None
     if prototype_audit_buffers["node_gate"]:
         gate_arr = np.concatenate(prototype_audit_buffers["node_gate"], axis=0).squeeze(-1)
+    entropy_gate_arr = None
+    if prototype_audit_buffers["node_entropy_gate"]:
+        entropy_gate_arr = np.concatenate(prototype_audit_buffers["node_entropy_gate"], axis=0).squeeze(-1)
+    radius_gate_arr = None
+    if prototype_audit_buffers["node_radius_gate"]:
+        radius_gate_arr = np.concatenate(prototype_audit_buffers["node_radius_gate"], axis=0).squeeze(-1)
+    top1_dist_arr = None
+    if prototype_audit_buffers["node_top1_proto_dist"]:
+        top1_dist_arr = np.concatenate(prototype_audit_buffers["node_top1_proto_dist"], axis=0).squeeze(-1)
+    top1_radius_arr = None
+    if prototype_audit_buffers["node_top1_proto_radius"]:
+        top1_radius_arr = np.concatenate(prototype_audit_buffers["node_top1_proto_radius"], axis=0).squeeze(-1)
+
     gate_mean = float(np.mean(gate_arr)) if gate_arr is not None else None
     gate_std = float(np.std(gate_arr)) if gate_arr is not None else None
+    entropy_gate_mean = float(np.mean(entropy_gate_arr)) if entropy_gate_arr is not None else None
+    entropy_gate_std = float(np.std(entropy_gate_arr)) if entropy_gate_arr is not None else None
+    radius_gate_mean = float(np.mean(radius_gate_arr)) if radius_gate_arr is not None else None
+    radius_gate_std = float(np.std(radius_gate_arr)) if radius_gate_arr is not None else None
     normal_gate_mean = None
     anomaly_gate_mean = None
+    normal_radius_gate_mean = None
+    anomaly_radius_gate_mean = None
+    normal_top1_proto_dist_mean = None
+    anomaly_top1_proto_dist_mean = None
+    normal_top1_proto_radius_mean = None
+    anomaly_top1_proto_radius_mean = None
     if gate_arr is not None and labels is not None and gate_arr.shape[0] >= len(labels):
         gate_arr = gate_arr[: len(labels)]
         normal_mask = labels == 0
         anomaly_mask = labels == 1
         normal_gate_mean = float(np.mean(gate_arr[normal_mask])) if np.any(normal_mask) else None
         anomaly_gate_mean = float(np.mean(gate_arr[anomaly_mask])) if np.any(anomaly_mask) else None
+        if radius_gate_arr is not None and radius_gate_arr.shape[0] >= len(labels):
+            radius_gate_arr = radius_gate_arr[: len(labels)]
+            normal_radius_gate_mean = float(np.mean(radius_gate_arr[normal_mask])) if np.any(normal_mask) else None
+            anomaly_radius_gate_mean = float(np.mean(radius_gate_arr[anomaly_mask])) if np.any(anomaly_mask) else None
+        if top1_dist_arr is not None and top1_dist_arr.shape[0] >= len(labels):
+            top1_dist_arr = top1_dist_arr[: len(labels)]
+            normal_top1_proto_dist_mean = float(np.mean(top1_dist_arr[normal_mask])) if np.any(normal_mask) else None
+            anomaly_top1_proto_dist_mean = float(np.mean(top1_dist_arr[anomaly_mask])) if np.any(anomaly_mask) else None
+        if top1_radius_arr is not None and top1_radius_arr.shape[0] >= len(labels):
+            top1_radius_arr = top1_radius_arr[: len(labels)]
+            normal_top1_proto_radius_mean = float(np.mean(top1_radius_arr[normal_mask])) if np.any(normal_mask) else None
+            anomaly_top1_proto_radius_mean = float(np.mean(top1_radius_arr[anomaly_mask])) if np.any(anomaly_mask) else None
 
     prototype_v2_summary = {
         "enable": bool(prototype_v2_cfg.get("enable", False)),
@@ -1462,10 +1614,25 @@ def evaluate(args):
         "usage_floor_loss": None,
         "prototype_repulsion_loss": None,
         "proto_nce_loss": None,
+        "correction_gate_mode": prototype_v2_cfg.get("correction_gate", {}).get("mode", "entropy"),
+        "correction_gate_min": float(prototype_v2_cfg.get("correction_gate", {}).get("min_gate", 0.0)),
+        "correction_gate_max": float(prototype_v2_cfg.get("correction_gate", {}).get("max_gate", 1.0)),
+        "radius_factor": float(prototype_v2_cfg.get("correction_gate", {}).get("radius_factor", 1.5)),
+        "radius_temperature": float(prototype_v2_cfg.get("correction_gate", {}).get("radius_temperature", 0.2)),
         "correction_gate_mean": gate_mean,
         "correction_gate_std": gate_std,
+        "entropy_gate_mean": entropy_gate_mean,
+        "entropy_gate_std": entropy_gate_std,
+        "radius_gate_mean": radius_gate_mean,
+        "radius_gate_std": radius_gate_std,
         "normal_correction_gate_mean": normal_gate_mean,
         "anomaly_correction_gate_mean": anomaly_gate_mean,
+        "normal_radius_gate_mean": normal_radius_gate_mean,
+        "anomaly_radius_gate_mean": anomaly_radius_gate_mean,
+        "normal_top1_proto_dist_mean": normal_top1_proto_dist_mean,
+        "anomaly_top1_proto_dist_mean": anomaly_top1_proto_dist_mean,
+        "normal_top1_proto_radius_mean": normal_top1_proto_radius_mean,
+        "anomaly_top1_proto_radius_mean": anomaly_top1_proto_radius_mean,
         "prototype_pairwise_distance_mean": (
             float(np.mean(prototype_audit_buffers["node_pairwise_distance_mean"]))
             if prototype_audit_buffers["node_pairwise_distance_mean"]

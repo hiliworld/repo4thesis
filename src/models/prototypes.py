@@ -77,6 +77,9 @@ class PrototypeCorrection(nn.Module):
         correction_gate_min: float = 0.05,
         correction_gate_max: float = 1.0,
         correction_gate_detach: bool = True,
+        correction_gate_radius_factor: float = 1.5,
+        correction_gate_radius_temperature: float = 0.2,
+        correction_gate_eps: float = 1.0e-8,
     ):
         super().__init__()
         self.lambda_node = lambda_node
@@ -89,28 +92,72 @@ class PrototypeCorrection(nn.Module):
         self.correction_gate_min = correction_gate_min
         self.correction_gate_max = correction_gate_max
         self.correction_gate_detach = correction_gate_detach
+        self.correction_gate_radius_factor = correction_gate_radius_factor
+        self.correction_gate_radius_temperature = correction_gate_radius_temperature
+        self.correction_gate_eps = correction_gate_eps
 
         self.linear_fuse = None
         if fusion_mode == "linear_fuse":
             self.linear_fuse = nn.Linear(latent_dim * 3, latent_dim)
 
-    def _resolve_node_gate(self, node_extra: dict, z_fused: torch.Tensor):
+    def _resolve_node_gate(
+        self,
+        node_extra: dict,
+        z_fused: torch.Tensor,
+        node_prototypes: torch.Tensor = None,
+        node_proto_radius: torch.Tensor = None,
+    ):
         default_gate = torch.ones(z_fused.shape[0], z_fused.shape[1], 1, device=z_fused.device, dtype=z_fused.dtype)
+        default_entropy_gate = default_gate
+        default_radius_gate = default_gate
+        default_top1_dist = torch.zeros_like(default_gate)
+        default_top1_radius = torch.ones_like(default_gate)
+
         if not self.correction_gate_enable or node_extra is None:
-            return default_gate
+            return default_gate, default_entropy_gate, default_radius_gate, default_top1_dist, default_top1_radius
+
+        entropy_gate = node_extra.get("assign_confidence_entropy", default_entropy_gate)
+        top2_gate = node_extra.get("assign_confidence_top2", default_entropy_gate)
+        radius_gate = default_radius_gate
+        top1_dist = default_top1_dist
+        top1_radius = default_top1_radius
 
         if self.correction_gate_mode == "top2":
-            gate = node_extra.get("assign_confidence_top2")
+            gate = top2_gate
+        elif self.correction_gate_mode == "entropy_radius":
+            gate = entropy_gate
+            assign = node_extra.get("assign")
+            if (
+                assign is not None
+                and node_prototypes is not None
+                and node_prototypes.ndim == 2
+                and node_prototypes.shape[0] > 0
+            ):
+                top1_idx = torch.argmax(assign, dim=-1)  # [B, N]
+                top1_proto = node_prototypes[top1_idx]  # [B, N, D]
+                top1_dist = torch.norm(z_fused - top1_proto, p=2, dim=-1, keepdim=True)
+
+                if node_proto_radius is None or node_proto_radius.numel() == 0:
+                    top1_radius = torch.ones_like(top1_dist)
+                else:
+                    radius_src = node_proto_radius.to(device=z_fused.device, dtype=z_fused.dtype)
+                    top1_radius = radius_src[top1_idx].unsqueeze(-1)
+                top1_radius = torch.clamp(top1_radius, min=self.correction_gate_eps)
+
+                threshold = self.correction_gate_radius_factor * top1_radius
+                denom = self.correction_gate_radius_temperature * top1_radius + self.correction_gate_eps
+                radius_gate = torch.sigmoid((threshold - top1_dist) / denom)
+                gate = gate * radius_gate
         else:
-            gate = node_extra.get("assign_confidence_entropy")
+            gate = entropy_gate
 
         if gate is None:
-            return default_gate
+            gate = default_gate
 
         gate = gate.clamp(self.correction_gate_min, self.correction_gate_max)
         if self.correction_gate_detach:
             gate = gate.detach()
-        return gate
+        return gate, entropy_gate, radius_gate, top1_dist, top1_radius
 
     def forward(
         self,
@@ -119,21 +166,28 @@ class PrototypeCorrection(nn.Module):
         patch_global_delta: torch.Tensor,
         z_node_proto: torch.Tensor,
         node_extra: dict = None,
+        node_prototypes: torch.Tensor = None,
+        node_proto_radius: torch.Tensor = None,
     ):
-        node_gate = self._resolve_node_gate(node_extra=node_extra, z_fused=z_fused)
+        node_gate, entropy_gate, radius_gate, top1_dist, top1_radius = self._resolve_node_gate(
+            node_extra=node_extra,
+            z_fused=z_fused,
+            node_prototypes=node_prototypes,
+            node_proto_radius=node_proto_radius,
+        )
 
         if self.fusion_mode == "linear_fuse":
             node_guided = z_fused + self.lambda_node * node_gate * node_delta if self.use_node_correction else z_fused
             patch_guided = patch_global_delta if self.use_patch_correction else torch.zeros_like(z_fused)
             z_cat = torch.cat([z_fused, node_guided, patch_guided], dim=-1)
-            return self.linear_fuse(z_cat), node_gate
+            return self.linear_fuse(z_cat), node_gate, entropy_gate, radius_gate, top1_dist, top1_radius
 
         z_corrected = z_fused
         if self.use_node_correction:
             z_corrected = z_corrected + self.lambda_node * node_gate * node_delta
         if self.use_patch_correction:
             z_corrected = z_corrected + self.lambda_patch * patch_global_delta
-        return z_corrected, node_gate
+        return z_corrected, node_gate, entropy_gate, radius_gate, top1_dist, top1_radius
 
 
 class NodePrototypeBank(nn.Module):
@@ -178,6 +232,9 @@ class PrototypeFusionModule(nn.Module):
         correction_gate_min: float = 0.05,
         correction_gate_max: float = 1.0,
         correction_gate_detach: bool = True,
+        correction_gate_radius_factor: float = 1.5,
+        correction_gate_radius_temperature: float = 0.2,
+        correction_gate_eps: float = 1.0e-8,
     ):
         super().__init__()
         self.use_node_prototype = use_node_prototype
@@ -199,6 +256,9 @@ class PrototypeFusionModule(nn.Module):
             correction_gate_min=correction_gate_min,
             correction_gate_max=correction_gate_max,
             correction_gate_detach=correction_gate_detach,
+            correction_gate_radius_factor=correction_gate_radius_factor,
+            correction_gate_radius_temperature=correction_gate_radius_temperature,
+            correction_gate_eps=correction_gate_eps,
         )
 
         self.register_buffer("node_proto_prior", torch.full((num_node_prototypes,), 1.0 / max(1, num_node_prototypes)))
@@ -273,6 +333,8 @@ class PrototypeFusionModule(nn.Module):
 
         if self.use_node_prototype and self.node_bank is not None:
             z_node_proto, node_assign, node_delta, node_extra = self.node_bank(z_fused, return_extra=True)
+            if node_extra is not None:
+                node_extra["assign"] = node_assign
 
         if self.use_patch_prototype and self.patch_embedder is not None and self.patch_bank is not None:
             z_patch, _ = self.patch_embedder(x)
@@ -280,12 +342,14 @@ class PrototypeFusionModule(nn.Module):
             patch_global = patch_delta.mean(dim=1)
             patch_global_delta = patch_global.unsqueeze(1).expand(batch_size, num_nodes, latent_dim)
 
-        z_corrected, node_gate = self.correction(
+        z_corrected, node_gate, node_entropy_gate, node_radius_gate, node_top1_proto_dist, node_top1_proto_radius = self.correction(
             z_fused=z_fused,
             node_delta=node_delta,
             patch_global_delta=patch_global_delta,
             z_node_proto=z_node_proto,
             node_extra=node_extra,
+            node_prototypes=(self.node_bank.prototypes if self.node_bank is not None else None),
+            node_proto_radius=self.node_proto_radius if self.node_bank is not None else None,
         )
 
         pairwise_stats = self.get_node_prototype_pairwise_stats()
@@ -303,6 +367,10 @@ class PrototypeFusionModule(nn.Module):
             "node_assign_entropy": None if node_extra is None else node_extra.get("assign_entropy").detach(),
             "node_assign_confidence": None if node_extra is None else node_extra.get("assign_confidence_entropy").detach(),
             "node_correction_gate": node_gate.detach(),
+            "node_entropy_gate": node_entropy_gate.detach(),
+            "node_radius_gate": node_radius_gate.detach(),
+            "node_top1_proto_dist": node_top1_proto_dist.detach(),
+            "node_top1_proto_radius": node_top1_proto_radius.detach(),
             "node_min_proto_dist": None if node_extra is None else node_extra.get("min_proto_dist").detach(),
             "prototype_pairwise_distance_mean": pairwise_stats["prototype_pairwise_distance_mean"],
             "prototype_pairwise_distance_min": pairwise_stats["prototype_pairwise_distance_min"],
