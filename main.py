@@ -459,7 +459,7 @@ def export_latent_audit_outputs(
     print(f"Saved latent audit summary json: {json_path}")
 
 
-def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, audit_buffers):
+def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, audit_buffers, prototype_v2_summary=None):
     os.makedirs("outputs", exist_ok=True)
     audit_path = "outputs/prototype_path_audit.json"
 
@@ -536,6 +536,30 @@ def export_prototype_path_audit(config, raw_diag, corrected_diag, hybrid_diag, a
                 "high_threshold": float(hybrid_diag["high"]),
                 "low_threshold": float(hybrid_diag["low"]),
             },
+        },
+        "prototype_v2": prototype_v2_summary or {
+            "enable": False,
+            "kmeans_initialized": False,
+            "core_percentile": None,
+            "tail_percentile": None,
+            "core_threshold": None,
+            "tail_threshold": None,
+            "num_core": None,
+            "num_gray": None,
+            "num_tail": None,
+            "cluster_frequency": None,
+            "cluster_radius": None,
+            "usage_floor_loss": None,
+            "prototype_repulsion_loss": None,
+            "proto_nce_loss": None,
+            "correction_gate_mean": None,
+            "correction_gate_std": None,
+            "normal_correction_gate_mean": None,
+            "anomaly_correction_gate_mean": None,
+            "prototype_pairwise_distance_mean": None,
+            "prototype_pairwise_distance_min": None,
+            "prototype_pairwise_cosine_mean": None,
+            "prototype_pairwise_cosine_max": None,
         },
     }
 
@@ -661,6 +685,65 @@ def compute_recon_loss(recon, x, criterion_mse, train_cfg):
     return l_recon, recon_mode, lambda_recon_last, lambda_recon_full
 
 
+def compute_train_self_score_from_outputs(outputs, x, config):
+    infer_cfg = config.get("inference", {})
+    alpha_pred = float(infer_cfg.get("alpha_pred", 1.0))
+    beta_recon = float(infer_cfg.get("beta_recon", 1.0))
+    raw_pred_error = torch.mean((outputs["pred_raw"] - x[:, -1, :]) ** 2, dim=1)
+    raw_recon_last_error = torch.mean((outputs["recon_raw"][:, -1, :] - x[:, -1, :]) ** 2, dim=1)
+    return alpha_pred * raw_pred_error + beta_recon * raw_recon_last_error
+
+
+def collect_train_scores_and_latents(model, train_loader, device, config):
+    model.eval()
+    score_chunks = []
+    latent_chunks = []
+    with torch.no_grad():
+        for batch in train_loader:
+            x = batch.to(device)
+            outputs = model(x)
+            score_chunks.append(compute_train_self_score_from_outputs(outputs, x, config).detach().cpu().numpy())
+            latent_chunks.append(outputs["z_fused"].detach().cpu().numpy())
+    if not score_chunks:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0, 1, 1), dtype=np.float32)
+    return np.concatenate(score_chunks).astype(np.float32), np.concatenate(latent_chunks).astype(np.float32)
+
+
+def simple_kmeans(x, k, num_iters=30, seed=42):
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x, dtype=np.float32)
+    n, d = x.shape
+    if n == 0:
+        return np.zeros((k, d), dtype=np.float32), np.zeros((0,), dtype=np.int64), [0] * k, [0.0] * k
+    if n < k:
+        pad_idx = rng.choice(n, size=k - n, replace=True)
+        init_idx = np.concatenate([np.arange(n), pad_idx], axis=0)
+    else:
+        init_idx = rng.choice(n, size=k, replace=False)
+    centers = x[init_idx].copy()
+    cluster_ids = np.zeros((n,), dtype=np.int64)
+    for _ in range(num_iters):
+        dists = np.sum((x[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+        cluster_ids = np.argmin(dists, axis=1)
+        for i in range(k):
+            mask = cluster_ids == i
+            if not np.any(mask):
+                centers[i] = x[rng.integers(0, n)]
+            else:
+                centers[i] = x[mask].mean(axis=0)
+    frequency = []
+    radius = []
+    for i in range(k):
+        mask = cluster_ids == i
+        cnt = int(mask.sum())
+        frequency.append(cnt)
+        if cnt == 0:
+            radius.append(0.0)
+        else:
+            radius.append(float(np.linalg.norm(x[mask] - centers[i], axis=1).mean()))
+    return centers, cluster_ids, frequency, radius
+
+
 def compute_slot_proto_stats(prototype_fusion, z_slots_np, labels=None):
     if prototype_fusion is None or z_slots_np is None:
         return {}
@@ -743,11 +826,39 @@ def train(args):
     criterion_cl = ContrastiveLoss(config["train"]["batch_size"], device=DEVICE)
 
     proto_cfg = config.get("model", {}).get("prototype", {})
+    prototype_v2_cfg = config.get("prototype_v2", {})
+    p2_enable = bool(prototype_v2_cfg.get("enable", False))
+    warmup_cfg = prototype_v2_cfg.get("warmup", {})
+    pseudo_split_cfg = prototype_v2_cfg.get("pseudo_split", {})
+    kmeans_cfg = prototype_v2_cfg.get("kmeans_init", {})
+    usage_floor_cfg = prototype_v2_cfg.get("usage_floor", {})
+    repulsion_cfg = prototype_v2_cfg.get("repulsion", {})
+    proto_nce_cfg = prototype_v2_cfg.get("proto_nce", {})
+    pseudo_tail_cfg = prototype_v2_cfg.get("pseudo_tail", {})
+
     lambda_node_proto_loss = float(proto_cfg.get("lambda_node_proto_loss", 0.02))
     lambda_patch_proto_loss = float(proto_cfg.get("lambda_patch_proto_loss", 0.02))
     lambda_corr_loss = float(proto_cfg.get("lambda_corr_loss", 0.005))
     lambda_node_balance = float(proto_cfg.get("lambda_node_balance", 0.001))
     lambda_patch_balance = float(proto_cfg.get("lambda_patch_balance", 0.001))
+
+    warmup_epochs = int(warmup_cfg.get("warmup_epochs", 0)) if bool(warmup_cfg.get("enable", False)) else 0
+    use_raw_heads_during_warmup = bool(warmup_cfg.get("use_raw_heads_during_warmup", True))
+    disable_proto_losses_during_warmup = bool(warmup_cfg.get("disable_proto_losses_during_warmup", True))
+
+    p2_state = {
+        "kmeans_initialized": False,
+        "core_threshold": None,
+        "tail_threshold": None,
+        "num_core": 0,
+        "num_gray": 0,
+        "num_tail": 0,
+        "cluster_frequency": None,
+        "cluster_radius": None,
+        "usage_floor_loss": 0.0,
+        "prototype_repulsion_loss": 0.0,
+        "proto_nce_loss": 0.0,
+    }
 
     epochs = config["train"]["epochs"]
     patience = config["train"]["patience"]
@@ -768,16 +879,6 @@ def train(args):
     labels = load_labels(config)
 
     print("Start Training")
-    print(
-        f"Reconstruction mode: {configured_recon_mode} | "
-        f"lambda_recon_last={lambda_recon_last:.4f} | "
-        f"lambda_recon_full={lambda_recon_full:.4f}"
-    )
-    print(
-        f"Checkpoint mode: {checkpoint_mode} | "
-        f"val_eval_interval={val_eval_interval} | "
-        f"val_subset_max_batches={val_subset_max_batches}"
-    )
     model.train()
     best_loss_path = "best_model_loss.pth"
     best_pa_f1_path = "best_model_pa_f1.pth"
@@ -788,14 +889,15 @@ def train(args):
     for epoch in range(epochs):
         epoch_loss = 0.0
         start = time.time()
+        is_warmup = p2_enable and (epoch + 1) <= warmup_epochs
 
         for batch in train_loader:
             x = batch.to(DEVICE)
             optimizer.zero_grad()
 
             outputs = model(x)
-            pred = outputs["pred"]
-            recon = outputs["recon"]
+            pred = outputs["pred_raw"] if (is_warmup and use_raw_heads_during_warmup) else outputs["pred"]
+            recon = outputs["recon_raw"] if (is_warmup and use_raw_heads_during_warmup) else outputs["recon"]
 
             l_pred = criterion_mse(pred, x[:, -1, :])
             l_recon, active_recon_mode, lambda_recon_last, lambda_recon_full = compute_recon_loss(
@@ -807,7 +909,6 @@ def train(args):
 
             noise = torch.randn_like(x) * 0.01
             outputs_aug = model(x + noise)
-
             z1 = outputs["z_local"].reshape(x.size(0), -1)
             z2 = outputs_aug["z_local"].reshape(x.size(0), -1)
             l_cl = criterion_cl(z1, z2)
@@ -822,52 +923,108 @@ def train(args):
                     l_window_repr = torch.mean((outputs["window_repr"] - outputs_aug["window_repr"]) ** 2)
 
             l_node_proto = torch.tensor(0.0, device=DEVICE)
-            node_proto_latent = outputs.get("node_proto_latent")
-            z_fused = outputs.get("z_fused")
-            if node_proto_latent is not None and z_fused is not None:
-                l_node_proto = torch.mean((node_proto_latent - z_fused) ** 2)
-
             l_patch_proto = torch.tensor(0.0, device=DEVICE)
-            patch_proto_latent = outputs.get("patch_proto_latent")
-            z_patch = outputs.get("z_patch")
-            if patch_proto_latent is not None and z_patch is not None:
-                l_patch_proto = torch.mean((patch_proto_latent - z_patch) ** 2)
-
             l_corr = torch.tensor(0.0, device=DEVICE)
-            z_corrected = outputs.get("z_corrected")
-            if z_corrected is not None and z_fused is not None:
-                l_corr = torch.mean((z_corrected - z_fused) ** 2)
-
             l_node_balance = torch.tensor(0.0, device=DEVICE)
-            node_assign = outputs.get("node_assign")
-            if node_assign is not None:
-                mean_node_assign = node_assign.mean(dim=(0, 1))
-                uniform_node = torch.full_like(mean_node_assign, 1.0 / mean_node_assign.numel())
-                l_node_balance = torch.sum(
-                    mean_node_assign * (torch.log(mean_node_assign + 1e-8) - torch.log(uniform_node + 1e-8))
-                )
-
             l_patch_balance = torch.tensor(0.0, device=DEVICE)
-            patch_assign = outputs.get("patch_assign")
-            if patch_assign is not None:
-                mean_patch_assign = patch_assign.mean(dim=(0, 1))
-                uniform_patch = torch.full_like(mean_patch_assign, 1.0 / mean_patch_assign.numel())
-                l_patch_balance = torch.sum(
-                    mean_patch_assign
-                    * (torch.log(mean_patch_assign + 1e-8) - torch.log(uniform_patch + 1e-8))
-                )
+            l_usage_floor = torch.tensor(0.0, device=DEVICE)
+            l_repulsion = torch.tensor(0.0, device=DEVICE)
+            l_proto_nce = torch.tensor(0.0, device=DEVICE)
+            l_tail_repulsion = torch.tensor(0.0, device=DEVICE)
 
-            loss = (
-                l_pred
-                + l_recon
-                + 0.1 * l_cl
-                + lambda_node_proto_loss * l_node_proto
-                + lambda_patch_proto_loss * l_patch_proto
-                + lambda_corr_loss * l_corr
-                + lambda_node_balance * l_node_balance
-                + lambda_patch_balance * l_patch_balance
-                + lambda_window_repr_cl * l_window_repr
-            )
+            z_fused = outputs.get("z_fused")
+            z_corrected = outputs.get("z_corrected")
+            node_proto_latent = outputs.get("node_proto_latent")
+            node_assign = outputs.get("node_assign")
+
+            apply_proto_losses = not (is_warmup and disable_proto_losses_during_warmup)
+            if apply_proto_losses:
+                if node_proto_latent is not None and z_fused is not None:
+                    if p2_enable and p2_state["kmeans_initialized"] and p2_state["core_threshold"] is not None:
+                        batch_score = compute_train_self_score_from_outputs(outputs, x, config)
+                        normal_core_mask = batch_score <= float(p2_state["core_threshold"])
+                        pseudo_tail_mask = batch_score >= float(p2_state["tail_threshold"])
+                        if normal_core_mask.any():
+                            z_fused_core = z_fused[normal_core_mask]
+                            node_proto_core = node_proto_latent[normal_core_mask]
+                            l_node_proto = torch.mean((node_proto_core - z_fused_core) ** 2)
+
+                            if bool(proto_nce_cfg.get("enable", True)) and model.prototype_fusion is not None:
+                                prototypes = model.prototype_fusion.get_node_prototypes()
+                                if prototypes is not None:
+                                    tau = float(proto_nce_cfg.get("tau", 0.1))
+                                    zc = z_fused_core.reshape(-1, z_fused_core.shape[-1])
+                                    target = node_assign[normal_core_mask].reshape(-1, node_assign.shape[-1])
+                                    if bool(proto_nce_cfg.get("use_stopgrad_assignment", True)):
+                                        target = target.detach()
+                                    sim = torch.matmul(
+                                        torch.nn.functional.normalize(zc, p=2, dim=-1),
+                                        torch.nn.functional.normalize(prototypes, p=2, dim=-1).transpose(0, 1),
+                                    )
+                                    logits = sim / tau
+                                    log_prob = torch.log_softmax(logits, dim=-1)
+                                    l_proto_nce = -(target * log_prob).sum(dim=-1).mean()
+
+                        if bool(pseudo_tail_cfg.get("enable_weak_repulsion", False)) and pseudo_tail_mask.any() and model.prototype_fusion is not None:
+                            prototypes = model.prototype_fusion.get_node_prototypes()
+                            if prototypes is not None:
+                                z_tail = z_fused[pseudo_tail_mask].reshape(-1, z_fused.shape[-1])
+                                min_dist = torch.cdist(z_tail, prototypes, p=2).min(dim=1).values
+                                margin_tail = float(pseudo_tail_cfg.get("margin", 0.5))
+                                l_tail_repulsion = torch.relu(margin_tail - min_dist).pow(2).mean()
+                    else:
+                        l_node_proto = torch.mean((node_proto_latent - z_fused) ** 2)
+
+                patch_proto_latent = outputs.get("patch_proto_latent")
+                z_patch = outputs.get("z_patch")
+                if patch_proto_latent is not None and z_patch is not None:
+                    l_patch_proto = torch.mean((patch_proto_latent - z_patch) ** 2)
+
+                if z_corrected is not None and z_fused is not None:
+                    l_corr = torch.mean((z_corrected - z_fused) ** 2)
+
+                patch_assign = outputs.get("patch_assign")
+                if node_assign is not None:
+                    mean_node_assign = node_assign.mean(dim=(0, 1))
+                    if p2_enable and p2_state["kmeans_initialized"] and bool(usage_floor_cfg.get("enable", True)):
+                        min_usage = float(usage_floor_cfg.get("min_usage", 0.03))
+                        l_usage_floor = torch.relu(min_usage - mean_node_assign).pow(2).mean()
+                    else:
+                        uniform_node = torch.full_like(mean_node_assign, 1.0 / mean_node_assign.numel())
+                        l_node_balance = torch.sum(
+                            mean_node_assign * (torch.log(mean_node_assign + 1e-8) - torch.log(uniform_node + 1e-8))
+                        )
+                if patch_assign is not None:
+                    mean_patch_assign = patch_assign.mean(dim=(0, 1))
+                    uniform_patch = torch.full_like(mean_patch_assign, 1.0 / mean_patch_assign.numel())
+                    l_patch_balance = torch.sum(
+                        mean_patch_assign * (torch.log(mean_patch_assign + 1e-8) - torch.log(uniform_patch + 1e-8))
+                    )
+
+                if p2_enable and p2_state["kmeans_initialized"] and bool(repulsion_cfg.get("enable", True)) and model.prototype_fusion is not None:
+                    prototypes = model.prototype_fusion.get_node_prototypes()
+                    if prototypes is not None and prototypes.shape[0] > 1:
+                        d = torch.cdist(prototypes, prototypes, p=2)
+                        mask = ~torch.eye(d.shape[0], dtype=torch.bool, device=d.device)
+                        dvals = d[mask]
+                        margin = float(repulsion_cfg.get("margin", 0.5))
+                        l_repulsion = torch.relu(margin - dvals).pow(2).mean()
+
+            loss = l_pred + l_recon + 0.1 * l_cl + lambda_window_repr_cl * l_window_repr
+            if apply_proto_losses:
+                loss = loss + lambda_patch_proto_loss * l_patch_proto + lambda_patch_balance * l_patch_balance
+                loss = loss + lambda_corr_loss * l_corr
+                if p2_enable and p2_state["kmeans_initialized"]:
+                    loss = loss + lambda_node_proto_loss * l_node_proto
+                    loss = loss + float(usage_floor_cfg.get("lambda_usage_floor", 0.001)) * l_usage_floor
+                    loss = loss + float(repulsion_cfg.get("lambda_repulsion", 0.001)) * l_repulsion
+                    loss = loss + float(proto_nce_cfg.get("lambda_proto_nce", 0.005)) * l_proto_nce
+                    loss = loss + float(pseudo_tail_cfg.get("lambda_tail_repulsion", 0.001)) * l_tail_repulsion
+                    p2_state["usage_floor_loss"] = float(l_usage_floor.detach().item())
+                    p2_state["prototype_repulsion_loss"] = float(l_repulsion.detach().item())
+                    p2_state["proto_nce_loss"] = float(l_proto_nce.detach().item())
+                else:
+                    loss = loss + lambda_node_proto_loss * l_node_proto + lambda_node_balance * l_node_balance
 
             loss.backward()
             optimizer.step()
@@ -876,6 +1033,92 @@ def train(args):
         avg_loss = epoch_loss / len(train_loader)
         cost = time.time() - start
         print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f} | Time: {cost:.1f}s")
+
+        if p2_enable and (not p2_state["kmeans_initialized"]) and (epoch + 1) == warmup_epochs and bool(pseudo_split_cfg.get("enable", True)):
+            scores, z_fused_windows = collect_train_scores_and_latents(model, train_loader, DEVICE, config)
+            core_percentile = float(pseudo_split_cfg.get("core_percentile", 95.0))
+            tail_percentile = float(pseudo_split_cfg.get("tail_percentile", 99.0))
+            core_threshold = float(np.percentile(scores, core_percentile))
+            tail_threshold = float(np.percentile(scores, tail_percentile))
+            normal_core_mask = scores <= core_threshold
+            pseudo_tail_mask = scores >= tail_threshold
+            gray_zone_mask = ~(normal_core_mask | pseudo_tail_mask)
+
+            p2_state["core_threshold"] = core_threshold
+            p2_state["tail_threshold"] = tail_threshold
+            p2_state["num_core"] = int(normal_core_mask.sum())
+            p2_state["num_gray"] = int(gray_zone_mask.sum())
+            p2_state["num_tail"] = int(pseudo_tail_mask.sum())
+
+            split_path = pseudo_split_cfg.get("save_path", "outputs/prototype_v2_pseudo_split.json")
+            os.makedirs(os.path.dirname(split_path), exist_ok=True)
+            with open(split_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "enable": True,
+                        "core_percentile": core_percentile,
+                        "tail_percentile": tail_percentile,
+                        "total_windows": int(scores.shape[0]),
+                        "num_core": p2_state["num_core"],
+                        "num_gray": p2_state["num_gray"],
+                        "num_tail": p2_state["num_tail"],
+                        "core_threshold": core_threshold,
+                        "tail_threshold": tail_threshold,
+                        "score_min": float(scores.min()),
+                        "score_mean": float(scores.mean()),
+                        "score_std": float(scores.std()),
+                        "score_max": float(scores.max()),
+                        "score_source": str(pseudo_split_cfg.get("score_source", "raw_pred_recon")),
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            if bool(kmeans_cfg.get("enable", True)) and model.prototype_fusion is not None and bool(kmeans_cfg.get("init_after_warmup", True)):
+                core_latents = z_fused_windows[normal_core_mask].reshape(-1, z_fused_windows.shape[-1])
+                max_samples = int(kmeans_cfg.get("max_samples", 50000))
+                if core_latents.shape[0] > max_samples:
+                    rng = np.random.default_rng(int(kmeans_cfg.get("random_seed", 42)))
+                    idx = rng.choice(core_latents.shape[0], size=max_samples, replace=False)
+                    core_latents = core_latents[idx]
+
+                k = int(proto_cfg.get("num_node_prototypes", 8))
+                centers, _, frequency, radius = simple_kmeans(
+                    core_latents,
+                    k=k,
+                    num_iters=int(kmeans_cfg.get("num_iters", 30)),
+                    seed=int(kmeans_cfg.get("random_seed", 42)),
+                )
+                centers_t = torch.from_numpy(centers).to(DEVICE)
+                prior_t = torch.from_numpy(np.asarray(frequency, dtype=np.float32) / max(float(sum(frequency)), 1.0)).to(DEVICE)
+                radius_t = torch.from_numpy(np.asarray(radius, dtype=np.float32)).to(DEVICE)
+                model.prototype_fusion.initialize_node_prototypes(centers_t, prior=prior_t, radius=radius_t)
+                p2_state["kmeans_initialized"] = True
+                p2_state["cluster_frequency"] = [int(v) for v in frequency]
+                p2_state["cluster_radius"] = [float(v) for v in radius]
+
+                init_path = kmeans_cfg.get("save_path", "outputs/prototype_v2_init_audit.json")
+                os.makedirs(os.path.dirname(init_path), exist_ok=True)
+                with open(init_path, "w", encoding="utf-8") as f:
+                    proto_norm = np.linalg.norm(centers, axis=1)
+                    json.dump(
+                        {
+                            "num_prototypes": int(k),
+                            "num_core_windows": int(normal_core_mask.sum()),
+                            "num_latents_used": int(core_latents.shape[0]),
+                            "cluster_frequency": p2_state["cluster_frequency"],
+                            "cluster_radius": p2_state["cluster_radius"],
+                            "prototype_norm_mean": float(proto_norm.mean()),
+                            "prototype_norm_std": float(proto_norm.std()),
+                            "kmeans_iters": int(kmeans_cfg.get("num_iters", 30)),
+                            "random_seed": int(kmeans_cfg.get("random_seed", 42)),
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+            model.train()
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -933,6 +1176,7 @@ def train(args):
         "val_subset_max_batches": int(val_subset_max_batches),
         "best_pa_f1": None if best_pa_f1 < 0 else float(best_pa_f1),
         "best_auc": None if best_auc < 0 else float(best_auc),
+        "prototype_v2": p2_state,
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(train_summary, f, ensure_ascii=False, indent=2)
@@ -1001,6 +1245,11 @@ def evaluate(args):
         "patch_usage": [],
         "node_entropy": [],
         "patch_entropy": [],
+        "node_gate": [],
+        "node_pairwise_distance_mean": [],
+        "node_pairwise_distance_min": [],
+        "node_pairwise_cosine_mean": [],
+        "node_pairwise_cosine_max": [],
         "slot_level": {},
     }
     slot_gate_buffers = {
@@ -1079,6 +1328,15 @@ def evaluate(args):
                 prototype_audit_buffers["patch_entropy"].append(float(patch_entropy_batch.mean().item()))
             else:
                 prototype_audit_buffers["patch_entropy"].append(0.0)
+
+            node_gate = outputs.get("node_correction_gate")
+            if node_gate is not None:
+                prototype_audit_buffers["node_gate"].append(node_gate.detach().cpu().numpy())
+            if outputs.get("prototype_pairwise_distance_mean") is not None:
+                prototype_audit_buffers["node_pairwise_distance_mean"].append(float(outputs["prototype_pairwise_distance_mean"]))
+                prototype_audit_buffers["node_pairwise_distance_min"].append(float(outputs["prototype_pairwise_distance_min"]))
+                prototype_audit_buffers["node_pairwise_cosine_mean"].append(float(outputs["prototype_pairwise_cosine_mean"]))
+                prototype_audit_buffers["node_pairwise_cosine_max"].append(float(outputs["prototype_pairwise_cosine_max"]))
 
             z_local_slots = outputs.get("z_local_slots")
             if z_local_slots is not None:
@@ -1163,6 +1421,73 @@ def evaluate(args):
     corrected_diag = branch_diagnostics(corrected_scores, labels, corrected_ref, infer_cfg)
     hybrid_diag = branch_diagnostics(hybrid_scores, labels, hybrid_ref, infer_cfg)
 
+    prototype_v2_cfg = config.get("prototype_v2", {})
+    pseudo_split_path = prototype_v2_cfg.get("pseudo_split", {}).get("save_path", "outputs/prototype_v2_pseudo_split.json")
+    init_audit_path = prototype_v2_cfg.get("kmeans_init", {}).get("save_path", "outputs/prototype_v2_init_audit.json")
+    pseudo_info = {}
+    init_info = {}
+    if os.path.exists(pseudo_split_path):
+        with open(pseudo_split_path, "r", encoding="utf-8") as f:
+            pseudo_info = json.load(f)
+    if os.path.exists(init_audit_path):
+        with open(init_audit_path, "r", encoding="utf-8") as f:
+            init_info = json.load(f)
+
+    gate_arr = None
+    if prototype_audit_buffers["node_gate"]:
+        gate_arr = np.concatenate(prototype_audit_buffers["node_gate"], axis=0).squeeze(-1)
+    gate_mean = float(np.mean(gate_arr)) if gate_arr is not None else None
+    gate_std = float(np.std(gate_arr)) if gate_arr is not None else None
+    normal_gate_mean = None
+    anomaly_gate_mean = None
+    if gate_arr is not None and labels is not None and gate_arr.shape[0] >= len(labels):
+        gate_arr = gate_arr[: len(labels)]
+        normal_mask = labels == 0
+        anomaly_mask = labels == 1
+        normal_gate_mean = float(np.mean(gate_arr[normal_mask])) if np.any(normal_mask) else None
+        anomaly_gate_mean = float(np.mean(gate_arr[anomaly_mask])) if np.any(anomaly_mask) else None
+
+    prototype_v2_summary = {
+        "enable": bool(prototype_v2_cfg.get("enable", False)),
+        "kmeans_initialized": bool(init_info),
+        "core_percentile": pseudo_info.get("core_percentile"),
+        "tail_percentile": pseudo_info.get("tail_percentile"),
+        "core_threshold": pseudo_info.get("core_threshold"),
+        "tail_threshold": pseudo_info.get("tail_threshold"),
+        "num_core": pseudo_info.get("num_core"),
+        "num_gray": pseudo_info.get("num_gray"),
+        "num_tail": pseudo_info.get("num_tail"),
+        "cluster_frequency": init_info.get("cluster_frequency"),
+        "cluster_radius": init_info.get("cluster_radius"),
+        "usage_floor_loss": None,
+        "prototype_repulsion_loss": None,
+        "proto_nce_loss": None,
+        "correction_gate_mean": gate_mean,
+        "correction_gate_std": gate_std,
+        "normal_correction_gate_mean": normal_gate_mean,
+        "anomaly_correction_gate_mean": anomaly_gate_mean,
+        "prototype_pairwise_distance_mean": (
+            float(np.mean(prototype_audit_buffers["node_pairwise_distance_mean"]))
+            if prototype_audit_buffers["node_pairwise_distance_mean"]
+            else None
+        ),
+        "prototype_pairwise_distance_min": (
+            float(np.mean(prototype_audit_buffers["node_pairwise_distance_min"]))
+            if prototype_audit_buffers["node_pairwise_distance_min"]
+            else None
+        ),
+        "prototype_pairwise_cosine_mean": (
+            float(np.mean(prototype_audit_buffers["node_pairwise_cosine_mean"]))
+            if prototype_audit_buffers["node_pairwise_cosine_mean"]
+            else None
+        ),
+        "prototype_pairwise_cosine_max": (
+            float(np.mean(prototype_audit_buffers["node_pairwise_cosine_max"]))
+            if prototype_audit_buffers["node_pairwise_cosine_max"]
+            else None
+        ),
+    }
+
     print("\n" + "=" * 60)
     print(f"FINAL RESULTS ({config['dataset']['name']})")
     print("=" * 60)
@@ -1198,6 +1523,7 @@ def evaluate(args):
         corrected_diag=corrected_diag,
         hybrid_diag=hybrid_diag,
         audit_buffers=prototype_audit_buffers,
+        prototype_v2_summary=prototype_v2_summary,
     )
     export_slot_gate_audit(
         config=config,
